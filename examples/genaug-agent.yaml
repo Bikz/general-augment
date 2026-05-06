@@ -1,0 +1,12 @@
+name: example-agent
+description: Example General Augment project manifest.
+model_preferences:
+  simple: simple
+  balanced: balanced
+  complex: complex
+tools:
+  builtin:
+    - web_search
+skills:
+  directory: ./skills
+channels: {}

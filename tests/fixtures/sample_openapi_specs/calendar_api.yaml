@@ -1,0 +1,158 @@
+openapi: 3.0.3
+info:
+  title: DayPlan Calendar API
+  version: 1.0.0
+  description: Calendar events, priorities, and daily plans.
+servers:
+  - url: https://calendar.example.com/api
+components:
+  securitySchemes:
+    UserOIDC:
+      type: openIdConnect
+      openIdConnectUrl: https://calendar.example.com/.well-known/openid-configuration
+  schemas:
+    Event:
+      type: object
+      required: [event_id, title, starts_at]
+      properties:
+        event_id:
+          type: string
+        title:
+          type: string
+        starts_at:
+          type: string
+          format: date-time
+        ends_at:
+          type: string
+          format: date-time
+paths:
+  /events:
+    get:
+      operationId: list_events
+      summary: List events
+      description: Get calendar events for a date range.
+      tags: [calendar]
+      security:
+        - UserOIDC: []
+      parameters:
+        - name: start_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: end_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: Events.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Event"
+    post:
+      operationId: create_event
+      summary: Create event
+      description: Create a calendar event after confirmation.
+      tags: [calendar]
+      security:
+        - UserOIDC: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, starts_at]
+              properties:
+                title:
+                  type: string
+                starts_at:
+                  type: string
+                  format: date-time
+                ends_at:
+                  type: string
+                  format: date-time
+      responses:
+        "201":
+          description: Created event.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+  /events/{event_id}:
+    patch:
+      operationId: update_event
+      summary: Update event
+      description: Update a calendar event after confirmation.
+      tags: [calendar]
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                starts_at:
+                  type: string
+                  format: date-time
+      responses:
+        "200":
+          description: Updated event.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+  /priorities:
+    get:
+      operationId: list_priorities
+      summary: List priorities
+      description: Get the user's current planning priorities.
+      tags: [planning]
+      responses:
+        "200":
+          description: Priorities.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  priorities:
+                    type: array
+                    items:
+                      type: string
+  /plans/today:
+    post:
+      operationId: create_daily_plan
+      summary: Create daily plan
+      description: Create a suggested plan for the user's day.
+      tags: [planning]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                focus:
+                  type: string
+      responses:
+        "201":
+          description: Created plan.

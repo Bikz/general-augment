@@ -1,0 +1,34 @@
+{
+  "name": "@general-augment/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the General Augment admin and integration APIs.",
+  "type": "module",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bikz/general-augment.git",
+    "directory": "packages/typescript-sdk"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "knip": "knip --no-progress",
+    "test": "npm run build && node --test test/*.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "knip": "^6.6.1",
+    "typescript": "^5.5.0"
+  },
+  "license": "MIT"
+}
