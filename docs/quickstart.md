@@ -3,6 +3,10 @@
 This quickstart is for app developers integrating General Augment from a trusted
 backend.
 
+Agent-readable docs are available at `https://docs.generalaugment.com/llms.txt`.
+For full implementation context, use `https://docs.generalaugment.com/llms-full.txt`
+or the page-level Markdown exports under `https://docs.generalaugment.com/markdown/`.
+
 ## 1. Create A Project
 
 Sign in at https://app.generalaugment.com, create a project, and copy a project API key.

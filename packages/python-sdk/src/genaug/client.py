@@ -6,8 +6,9 @@ The SDK targets the public admin and integration APIs exposed by the General Aug
 - `/api/v1/integrations/*` for app-user identity linking
 
 It also wraps `/v1/responses` and `/api/v1/agent/memory/*` for app backend
-integrations. See `docs/public/SDK-REFERENCE.md` in the monorepo for end-to-end
-examples.
+integrations. See https://docs.generalaugment.com/sdk/reference/ for end-to-end
+examples and https://docs.generalaugment.com/markdown/sdk/reference.md for the
+Markdown export.
 """
 
 from __future__ import annotations

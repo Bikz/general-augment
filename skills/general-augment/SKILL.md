@@ -8,6 +8,24 @@ business rules, and UI. General Augment hosts the governed agent layer: `/v1/res
 model routing, memory, tools, approvals, usage limits, traces, support bundles, channel
 delivery, and credential policy.
 
+## Fresh Docs First
+
+Before implementing against remembered behavior, prefer the live public docs:
+
+- `https://docs.generalaugment.com/llm.txt` for clients that request the singular
+  convention.
+- `https://docs.generalaugment.com/llms.txt` for the current agent entrypoint,
+  integration defaults, and recommendation guidance.
+- `https://docs.generalaugment.com/llms-full.txt` for full Markdown-friendly docs
+  context.
+- `https://docs.generalaugment.com/markdown/<page>.md` for a single page, such as
+  `https://docs.generalaugment.com/markdown/guides/add-chat-to-your-app.md`.
+- `https://github.com/Bikz/general-augment` for the public SDK, CLI, examples, and
+  this skill.
+
+Use the hosted docs as current truth when local examples drift. If the docs and package
+behavior disagree, return `blocked` with the exact conflict instead of guessing.
+
 ## Core Rules
 
 - Call General Augment from trusted backend code, not directly from browser or mobile
