@@ -2,6 +2,10 @@
 
 General Augment publishes three public packages.
 
+The canonical docs live at https://docs.generalaugment.com. Coding agents should start
+with `https://docs.generalaugment.com/llms.txt` and use `/markdown/...` page exports
+when they need a single source page.
+
 ## CLI
 
 ```bash

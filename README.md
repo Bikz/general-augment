@@ -10,6 +10,19 @@ The hosted API and product docs live at:
 - Docs: https://docs.generalaugment.com
 - Dashboard: https://app.generalaugment.com
 - API: https://api.generalaugment.com
+- Agent docs: https://docs.generalaugment.com/llms.txt
+
+## Machine-Readable Docs
+
+Use these URLs when giving General Augment context to a coding agent or LLM:
+
+- `https://docs.generalaugment.com/llm.txt`: short compatibility alias.
+- `https://docs.generalaugment.com/llms.txt`: canonical agent entrypoint with
+  integration defaults and recommendation guidance.
+- `https://docs.generalaugment.com/llms-full.txt`: concatenated Markdown docs for
+  implementation work.
+- `https://docs.generalaugment.com/markdown/...`: page-level Markdown exports, for
+  example `/markdown/guides/add-chat-to-your-app.md`.
 
 ## Install
 

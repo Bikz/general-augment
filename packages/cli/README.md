@@ -10,16 +10,18 @@ genaug --version
 genaug auth login --api-key ga_admin_redacted
 genaug doctor
 genaug projects list
-genaug init dayplan-agent --tool web_search
-genaug integrate https://petstore3.swagger.io/api/v3/openapi.json
-genaug validate ./petstore-agent/genaug-agent.yaml
-genaug deploy ./petstore-agent/genaug-agent.yaml
-genaug keys create --project petstore-agent --name "Production backend"
+genaug init demo-agent --tool web_search
+genaug integrate https://petstore3.swagger.io/api/v3/openapi.json \
+  --name demo-agent \
+  --output-dir ./demo-agent
+genaug validate ./demo-agent/genaug-agent.yaml
+genaug deploy ./demo-agent/genaug-agent.yaml
+genaug keys create --project demo-agent --name "Production backend"
 genaug mock --host 127.0.0.1 --port 8787 --quiet
-genaug smoke --idempotency-key smoke-replay-1 --metadata feature=spark
-genaug smoke --project petstore-agent
-genaug verify --project petstore-agent
-genaug onboarding verify --project petstore-agent --json
+genaug smoke --idempotency-key smoke-replay-1 --metadata feature=demo
+genaug smoke --project demo-agent
+genaug verify --project demo-agent
+genaug onboarding verify --project demo-agent --json
 ```
 
 `genaug auth login` verifies the key against `/api/v1/admin/me` before writing local
@@ -46,6 +48,11 @@ update the project and register the generated OpenAPI tools in one pass. Without
 `genaug deploy ./<agent>/genaug-agent.yaml`. `deploy` runs the same local validation
 before calling the hosted API. Both scaffolds include
 `CODING_AGENT_PROMPT.md`, which is the paste-ready backend handoff for a coding agent.
+
+Current public docs for agents are available at
+`https://docs.generalaugment.com/llms.txt`. Use
+`https://docs.generalaugment.com/llms-full.txt` or the `/markdown/...` page exports
+when a coding agent needs implementation context without navigating the HTML site.
 
 ## Common workflows
 
@@ -93,9 +100,9 @@ before calling the hosted API. Both scaffolds include
 ## Billing
 
 ```bash
-genaug billing checkout --project dayplan-agent --tier pro
-genaug billing portal --project dayplan-agent
-genaug billing events --project dayplan-agent --json
+genaug billing checkout --project demo-agent --tier pro
+genaug billing portal --project demo-agent
+genaug billing events --project demo-agent --json
 ```
 
 Use these commands for hosted billing actions when Stripe is configured for the

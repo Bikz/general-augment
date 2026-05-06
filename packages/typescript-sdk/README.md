@@ -4,6 +4,10 @@ Backend SDK for General Augment app integrations. Use it from trusted server cod
 Project-scoped keys are for app traffic such as Responses and memory calls. Admin and
 setup helpers require a management/admin-capable key and send it as `X-Admin-Key`.
 
+Agent-readable docs: `https://docs.generalaugment.com/llms.txt`. SDK reference:
+`https://docs.generalaugment.com/sdk/reference/` or the Markdown export at
+`https://docs.generalaugment.com/markdown/sdk/reference.md`.
+
 ```bash
 npm install @general-augment/sdk
 ```
