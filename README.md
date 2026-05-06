@@ -33,6 +33,8 @@ genaug smoke --message "Reply with: ok" --json
 Python:
 
 ```python
+import os
+
 from genaug import GeneralAugmentClient, response_output_text
 
 client = GeneralAugmentClient(api_key=os.environ["GENAUG_API_KEY"])
@@ -82,6 +84,13 @@ Coding agents can use [`skills/general-augment/SKILL.md`](skills/general-augment
 as their integration playbook. It covers server-side key handling, `/v1/responses`,
 tenant-owned provider capacity, stable user IDs, tool governance, memory, traces, and
 ready/blocked verification.
+
+## Guides
+
+- [Quickstart](docs/quickstart.md)
+- [Platform guide](docs/platform-guide.md)
+- [Integration checklist](docs/integration-checklist.md)
+- [Packages](docs/packages.md)
 
 ## Security Rules
 

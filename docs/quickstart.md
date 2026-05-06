@@ -66,3 +66,6 @@ genaug onboarding verify --project my-agent --json
 
 Return a clear `ready` or `blocked` verdict with exact failing command output when a
 coding agent implements the integration.
+
+Next, use the [platform guide](platform-guide.md) for tools, memory, model providers,
+channels, approvals, observability, billing, and launch evidence.
