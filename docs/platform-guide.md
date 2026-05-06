@@ -11,7 +11,7 @@ governed agent layer around those app systems.
 | Dashboard | Project setup, API keys, model providers, tools, channels, usage, traces, users, billing | https://app.generalaugment.com | `genaug projects list` |
 | Responses API | App backend agent turns | App backend code | Python SDK, TypeScript SDK, raw HTTP |
 | Model providers | Tenant-owned model/API capacity | Project model provider panel | `genaug model-providers` |
-| Tools | Governed app/API actions | Project tools pages | `genaug integrate`, `genaug tools`, `genaug mcp` |
+| Tools | Governed app/API actions and BYO local connector capabilities | Project tools pages | `genaug integrate`, `genaug tools`, `genaug mcp` |
 | Skills | Durable tenant behavior guidance | Project skills pages | `genaug skills apply` |
 | Memory | User-scoped durable facts | User/memory views | SDK memory methods, `genaug memory` |
 | Identity | Map app users to General Augment users and channels | Identity views | `genaug identity` |
@@ -27,7 +27,8 @@ governed agent layer around those app systems.
 3. Run `genaug smoke --json` against `/v1/responses`.
 4. Add tenant-owned model provider credentials when production traffic should use the
    tenant's own provider account.
-5. Add generated OpenAPI tools or MCP servers.
+5. Add generated OpenAPI tools, MCP servers, or BYO local connectors for private
+   capacity.
 6. Add skills and SOUL/personality guidance.
 7. Add memory only for durable user facts the app is allowed to retain.
 8. Add identity linking and external channels if users will interact outside the app UI.
@@ -72,6 +73,13 @@ genaug model-providers list --project my-agent
 
 Use OpenAPI specs for app-owned APIs and MCP for external tool surfaces when the
 credential and audit boundary is acceptable.
+
+Use BYO local connectors for tenant-owned private capacity such as a Mac, VM, coding
+sandbox, desktop automation host, or private network service. The connector keeps local
+credentials and adapter internals private; General Augment exposes only governed tool
+schemas to the runtime and handles approval, audit, redaction, policy, and rate limits.
+iMessage should use this pattern through a tenant-owned Mac rather than raw shell or
+direct adapter access.
 
 ```bash
 genaug integrate ./openapi.yaml --name my-agent --auto-deploy
