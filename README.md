@@ -2,7 +2,7 @@
 
 General Augment is the agent backend for your app. Use one hosted
 Responses-compatible API to add model routing, memory, tools, approvals, usage limits,
-traces, and support receipts to your product.
+traces, governed local connectors, and support receipts to your product.
 
 This repository contains the public SDKs, CLI, examples, and agent-integration guidance.
 The hosted API and product docs live at:

@@ -101,6 +101,14 @@ test as the whole launch.
 - Keep destructive or expensive tools behind explicit approval policies.
 - Use MCP servers only when the app owner accepts the credential, network, and audit
   boundary.
+- Use BYO local connectors when a tenant wants private capacity, such as a local Mac,
+  VM, coding sandbox, desktop automation host, or private network service. General
+  Augment should govern the tool schema, routing, approval, audit, redaction, and rate
+  limits; the tenant-owned host should keep local credentials, local files, provider
+  sessions, and adapter internals private.
+- For iMessage, connect a tenant-owned Mac through a local connector. Do not expose raw
+  shell, direct adapter commands, Apple IDs, phone numbers, message history, local paths,
+  or connector tokens to the model, docs, logs, or support artifacts.
 - Use `genaug skills apply` for tenant-specific durable behavior instructions.
 - Verify enabled tools and skills with `genaug projects runtime-policy --json`,
   `genaug tools list`, and `genaug skills list`.
@@ -112,6 +120,7 @@ genaug integrate ./openapi.yaml --name <project-slug> --auto-deploy
 genaug projects runtime-policy --project <project-slug> --json
 genaug tools list --project <project-slug>
 genaug tools discovery --project <project-slug> --json
+genaug projects runtime-policy --project <project-slug> --json
 genaug mcp list --project <project-slug>
 genaug skills list --project <project-slug>
 ```
