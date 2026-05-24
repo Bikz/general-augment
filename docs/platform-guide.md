@@ -9,10 +9,12 @@ governed agent layer around those app systems.
 | Surface | What It Is For | Human Path | Agent/CLI Path |
 | --- | --- | --- | --- |
 | Dashboard | Project setup, API keys, model providers, tools, channels, usage, traces, users, billing | https://app.generalaugment.com | `genaug projects list` |
+| Self-serve setup | Install/configure General Augment without code edits | CLI browser consent | `genaug auth login`, `genaug setup --bootstrap` |
+| Safe migration | Patch an existing OpenAI Responses app after diff review | PR or local diff review | `genaug migrate openai-responses` |
 | Responses API | App backend agent turns | App backend code | Python SDK, TypeScript SDK, raw HTTP |
-| Model providers | Tenant-owned model/API capacity | Project model provider panel | `genaug model-providers` |
-| Tools | Governed app/API actions and BYO local connector capabilities | Project tools pages | `genaug integrate`, `genaug tools`, `genaug mcp` |
-| Skills | Durable tenant behavior guidance | Project skills pages | `genaug skills apply` |
+| Capability providers | Tenant-owned coding, browser, search, video, and model/API capacity | Project provider panels | `genaug providers setup`, `genaug model-providers` |
+| Tools | Governed app/API actions and BYO local connector capabilities | Project tools pages | `genaug integrate`, `genaug tools`, `genaug mcp`, `genaug connectors setup` |
+| Skills | Durable tenant behavior guidance | Project skills pages | `genaug skills design`, `genaug skills apply` |
 | Memory | User-scoped durable facts | User/memory views | SDK memory methods, `genaug memory` |
 | Identity | Map app users to General Augment users and channels | Identity views | `genaug identity` |
 | Channels | Telegram, WhatsApp, SMS, and other delivery surfaces | Channel setup flows | `genaug channels` |
@@ -22,18 +24,22 @@ governed agent layer around those app systems.
 
 ## Recommended Integration Order
 
-1. Create a project in the dashboard.
-2. Store a project API key in the app backend.
-3. Run `genaug smoke --json` against `/v1/responses`.
-4. Add tenant-owned model provider credentials when production traffic should use the
+1. Run `genaug auth login`.
+2. Run `genaug setup --bootstrap` to create or select the project and print runtime env.
+3. For existing OpenAI Responses apps, run `genaug migrate openai-responses --dry-run`
+   and apply only after reviewing the diff.
+4. Store the project runtime key in the app backend.
+5. Run `genaug smoke --evidence-output .genaug/smoke-evidence.json --json` against `/v1/responses`.
+6. Add tenant-owned model provider credentials when production traffic should use the
    tenant's own provider account.
-5. Add generated OpenAPI tools, MCP servers, or BYO local connectors for private
+7. Add generated OpenAPI tools, MCP servers, or BYO local connectors for private
    capacity.
-6. Add skills and SOUL/personality guidance.
-7. Add memory only for durable user facts the app is allowed to retain.
-8. Add identity linking and external channels if users will interact outside the app UI.
-9. Verify traces, usage, support bundles, and approval behavior.
-10. Run `genaug verify --json` and `genaug onboarding verify --json`.
+8. Add skills and SOUL/personality guidance.
+9. Add memory only for durable user facts the app is allowed to retain.
+10. Add identity linking and external channels if users will interact outside the app UI.
+11. Verify traces, usage, support bundles, and approval behavior.
+12. Run `genaug verify --json`, `genaug onboarding verify --json`, and
+    `genaug dashboard open --project <project>`.
 
 ## Responses API
 
@@ -61,6 +67,7 @@ Store provider keys through the dashboard or CLI; never put raw keys in code, pr
 memory facts, docs, screenshots, or support artifacts.
 
 ```bash
+genaug providers setup --capability browse --project my-agent --api-key-env BROWSERBASE_API_KEY --health-check
 genaug model-providers set openai \
   --project my-agent \
   --api-key "$OPENAI_API_KEY"
@@ -83,6 +90,9 @@ direct adapter access.
 
 ```bash
 genaug integrate ./openapi.yaml --name my-agent --auto-deploy
+genaug connectors setup --name browserbase \
+  --url 'https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}' \
+  --health-check
 genaug tools list --project my-agent
 genaug tools toggle delete_account --project my-agent --disable
 genaug tools discovery --project my-agent --mode always --json
@@ -103,6 +113,7 @@ genaug approvals deny <approval-id> --project my-agent --yes
 Use skills for durable project behavior and repeatable operating rules.
 
 ```bash
+genaug skills design --job-type website-builder --project my-agent --apply
 genaug skills list --project my-agent
 genaug skills apply ./skills/schedule-meeting/SKILL.md --project my-agent
 genaug skills view "Schedule Meeting" --project my-agent
@@ -144,7 +155,8 @@ genaug channels test telegram --project my-agent
 When debugging, keep a redacted support receipt instead of screenshots or raw logs.
 
 ```bash
-genaug smoke --project my-agent --json
+genaug smoke --project my-agent --evidence-output .genaug/smoke-evidence.json --json
+genaug smoke --project my-agent --include-support-bundle --evidence-output artifacts/smoke-evidence.json --json
 genaug logs --project my-agent --follow
 genaug observability trace <trace-id> --project my-agent --json
 genaug observability support-bundle --project my-agent --json
@@ -188,6 +200,7 @@ A real launch proof should include:
 - dashboard project setup proof;
 - model-provider health evidence when using tenant-owned capacity;
 - `/v1/responses` smoke with response ID and trace ID;
+- smoke evidence JSON with dashboard observability links;
 - memory behavior proof if memory is in scope;
 - tool-call audit and approval proof if tools are in scope;
 - support bundle or trace evidence;

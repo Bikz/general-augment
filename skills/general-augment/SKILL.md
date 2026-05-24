@@ -79,13 +79,33 @@ Request body:
 
 ## CLI Verification
 
+For a new app, run setup mode before editing app code:
+
+```bash
+genaug auth login
+genaug setup --bootstrap --project-name "<Project Name>" --project-slug <project-slug> --print-env
+genaug providers setup --capability <capability> --project <project-slug> --health-check
+genaug connectors setup --name <connector-name> --url '<secret-safe-mcp-url>' --health-check
+genaug skills design --job-type <job-type> --project <project-slug> --apply
+```
+
+For an existing OpenAI Responses app, inspect first and apply only after the human or
+repo owner accepts the diff:
+
+```bash
+genaug init --json
+genaug migrate openai-responses --dry-run --json
+genaug migrate openai-responses --apply --yes
+```
+
 Run these before calling the work done:
 
 ```bash
 genaug doctor
-genaug smoke --project <project-slug> --json
+genaug smoke --project <project-slug> --evidence-output .genaug/smoke-evidence.json --json
 genaug verify --project <project-slug> --json
 genaug onboarding verify --project <project-slug> --json
+genaug dashboard open --project <project-slug>
 ```
 
 If any command fails, return `blocked` with the exact failing command, status code,
@@ -101,6 +121,9 @@ test as the whole launch.
 - Keep destructive or expensive tools behind explicit approval policies.
 - Use MCP servers only when the app owner accepts the credential, network, and audit
   boundary.
+- Use `genaug connectors setup` for MCP connector write-through. Never store raw
+  provider keys in MCP URLs; use credential placeholders such as
+  `${{ providers.browserbase.api_key }}`.
 - Use BYO local connectors when a tenant wants private capacity, such as a local Mac,
   VM, coding sandbox, desktop automation host, or private network service. General
   Augment should govern the tool schema, routing, approval, audit, redaction, and rate
@@ -117,6 +140,9 @@ Useful commands:
 
 ```bash
 genaug integrate ./openapi.yaml --name <project-slug> --auto-deploy
+genaug connectors setup --name browserbase --project <project-slug> \
+  --url 'https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}' \
+  --health-check
 genaug projects runtime-policy --project <project-slug> --json
 genaug tools list --project <project-slug>
 genaug tools discovery --project <project-slug> --json
@@ -136,10 +162,11 @@ genaug skills list --project <project-slug>
 ## Model Providers
 
 - Prefer tenant-owned provider keys for production traffic.
-- Use dashboard model-provider setup or `genaug model-providers set`.
+- Use dashboard provider setup, `genaug providers setup`, or `genaug model-providers set`.
 - Verify provider attribution before claiming tenant-owned capacity works.
 
 ```bash
+genaug providers setup --capability browse --project <project-slug> --health-check
 genaug model-providers list --project <project-slug>
 genaug model-providers health <provider> --project <project-slug> --json
 ```
@@ -165,6 +192,7 @@ genaug channels test telegram --project <project-slug>
 
 ```bash
 genaug logs --project <project-slug>
+genaug smoke --project <project-slug> --include-support-bundle --evidence-output artifacts/smoke-evidence.json --json
 genaug observability trace <trace-id> --project <project-slug> --json
 genaug observability support-bundle --project <project-slug> --json
 genaug projects usage --project <project-slug> --json

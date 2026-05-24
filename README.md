@@ -34,13 +34,28 @@ npm install @general-augment/sdk
 
 ## Quick Start
 
-Create a project in the dashboard, copy a project API key from a trusted server-side
-environment, then call `/v1/responses` from your backend.
+For a new app, let the CLI create or select the project, collect setup choices, and
+print the backend runtime env block once:
 
 ```bash
-export GENAUG_API_KEY="ga_project_..."
-export GENAUG_API_BASE_URL="https://api.generalaugment.com"
-genaug smoke --message "Reply with: ok" --json
+genaug auth login
+genaug setup --bootstrap --project-name "My Agent" --project-slug my-agent --print-env
+genaug providers setup --capability browse --project my-agent --api-key-env BROWSERBASE_API_KEY --health-check
+genaug connectors setup --name browserbase \
+  --url 'https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}' \
+  --health-check
+genaug skills design --job-type website-builder --project my-agent --apply
+genaug smoke --project my-agent --evidence-output .genaug/smoke-evidence.json --json
+genaug dashboard open --project my-agent
+```
+
+For an existing OpenAI Responses app, ask your coding agent to run the migration path
+instead. It inspects first, writes a diff, and only edits code after explicit consent:
+
+```bash
+genaug init --json
+genaug migrate openai-responses --dry-run --json
+genaug migrate openai-responses --apply --yes
 ```
 
 Python:
@@ -120,13 +135,19 @@ ready/blocked verification.
 
 ```bash
 genaug auth login --api-key "$GENAUG_ADMIN_API_KEY"
+genaug auth login
+genaug setup --bootstrap --project-name "My Agent" --project-slug my-agent --print-env
+genaug migrate openai-responses --dry-run --json
+genaug providers setup --capability browse --project my-agent --api-key-env BROWSERBASE_API_KEY --health-check
+genaug connectors setup --name browserbase --url 'https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}' --health-check
+genaug skills design --job-type website-builder --project my-agent --apply
 genaug doctor
 genaug projects list
 genaug init my-agent --tool web_search
 genaug validate ./my-agent/genaug-agent.yaml
 genaug deploy ./my-agent/genaug-agent.yaml
 genaug model-providers set openai --project my-agent --api-key "$OPENAI_API_KEY"
-genaug smoke --project my-agent --json
+genaug smoke --project my-agent --evidence-output .genaug/smoke-evidence.json --json
 genaug verify --project my-agent --json
 genaug onboarding verify --project my-agent --json
 ```

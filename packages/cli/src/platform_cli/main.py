@@ -14,14 +14,20 @@ from platform_cli.commands import (
     auth,
     billing,
     channels,
+    connectors,
+    dashboard,
+    evals,
     identity,
+    jobs,
     keys,
     mcp,
     memory,
+    migrate,
     model_providers,
     observability,
     onboarding,
     projects,
+    providers,
     skills,
     tools,
     users,
@@ -33,6 +39,7 @@ from platform_cli.commands.init import init
 from platform_cli.commands.integrate import integrate
 from platform_cli.commands.logs import logs
 from platform_cli.commands.mock import mock
+from platform_cli.commands.setup import setup
 from platform_cli.commands.smoke import smoke
 from platform_cli.commands.status import status
 from platform_cli.commands.validate import validate
@@ -60,11 +67,18 @@ app.add_typer(model_providers.app, name="model-providers")
 app.add_typer(memory.app, name="memory")
 app.add_typer(users.app, name="users")
 app.add_typer(identity.app, name="identity")
+app.add_typer(jobs.app, name="jobs")
 app.add_typer(observability.app, name="observability")
 app.add_typer(channels.app, name="channels")
 app.add_typer(onboarding.app, name="onboarding")
+app.add_typer(evals.app, name="evals")
+app.add_typer(providers.app, name="providers")
+app.add_typer(connectors.app, name="connectors")
+app.add_typer(migrate.app, name="migrate")
+app.add_typer(dashboard.app, name="dashboard")
 app.command("integrate")(integrate)
 app.command("init")(init)
+app.command("setup")(setup)
 app.command("deploy")(deploy)
 app.command("dev")(dev)
 app.command("doctor")(doctor)

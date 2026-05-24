@@ -67,6 +67,24 @@ class PlatformClient:
         """Call a public API endpoint."""
         return self._request(method, path, params=params, authenticated=False)
 
+    def installer(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Mapping[str, Any] | None = None,
+        token: str | None = None,
+    ) -> Any:
+        """Call an installer-auth endpoint."""
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        return self._request(
+            method,
+            f"/api/v1/installer{path}",
+            json=json,
+            extra_headers=headers,
+            authenticated=False,
+        )
+
     def integrations(
         self,
         method: str,

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 import typer
 
-from platform_cli.client import resolve_project
-from platform_cli.output import panel, print_json, table
+from platform_cli.client import encode_path_segment, resolve_project
+from platform_cli.errors import CLIError
+from platform_cli.output import panel, print_json, print_success, table
 from platform_cli.runtime import Runtime
+from platform_cli.self_serve import DEFAULT_DASHBOARD_URL, dashboard_project_url
 
 DEFAULT_SMOKE_MESSAGE = "Reply exactly with: genaug-smoke-ok"
 DEFAULT_STRUCTURED_MESSAGE = 'Return JSON with ok=true and label="genaug-smoke-ok".'
@@ -69,9 +73,26 @@ def smoke(
         ),
     ] = None,
     raw: Annotated[bool, typer.Option("--json", help="Print the raw response JSON.")] = False,
+    evidence_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--evidence-output",
+            "-o",
+            help="Write redacted smoke evidence JSON for launch/support review.",
+        ),
+    ] = None,
+    include_support_bundle: Annotated[
+        bool,
+        typer.Option(
+            "--include-support-bundle",
+            help="Fetch and embed the project support bundle; requires --project and admin auth.",
+        ),
+    ] = False,
 ) -> None:
     """Run health plus one `/v1/responses` smoke request."""
     runtime: Runtime = ctx.obj
+    if include_support_bundle and not project:
+        raise CLIError("--include-support-bundle requires --project.")
     turn_id = uuid.uuid4().hex[:12]
     schema = _load_schema(schema_file) if schema_file else None
     structured = structured or schema is not None
@@ -91,20 +112,53 @@ def smoke(
     if structured:
         payload["text"] = _structured_text_format(schema or DEFAULT_STRUCTURED_SCHEMA)
     project_payload: dict[str, Any] | None = None
+    support_bundle: dict[str, Any] | None = None
     with runtime.client() as client:
         ready = client.public("GET", "/health/ready")
         if project:
             project_payload = resolve_project(client, project)
             headers["X-Project-ID"] = str(project_payload["id"])
         response = client.app("POST", "/v1/responses", json=payload, headers=headers)
+        metadata_payload = response.get("metadata", {}) if isinstance(response, dict) else {}
+        if include_support_bundle and project_payload is not None:
+            support_bundle = client.admin(
+                "GET",
+                (
+                    f"/projects/{encode_path_segment(str(project_payload['id']))}"
+                    "/observability/support-bundle"
+                ),
+                params=_support_bundle_params(
+                    trace_id=_metadata_value(
+                        metadata_payload,
+                        "general_augment_trace_id",
+                        "trace_id",
+                    ),
+                    response_id=response.get("id") if isinstance(response, dict) else None,
+                    user_id=user,
+                ),
+            )
 
-    metadata_payload = response.get("metadata", {}) if isinstance(response, dict) else {}
     support_receipt = _support_receipt(
         ready=ready,
         response=response,
         metadata=metadata_payload,
         project=project_payload,
     )
+    dashboard_urls = _dashboard_evidence_urls(
+        project=project_payload,
+        trace_id=support_receipt.get("trace_id"),
+        response_id=support_receipt.get("response_id"),
+        user_id=user,
+    )
+    smoke_evidence = _smoke_evidence(
+        ready=ready,
+        response=response,
+        support_receipt=support_receipt,
+        dashboard_urls=dashboard_urls,
+        support_bundle=support_bundle,
+    )
+    if evidence_output is not None:
+        _write_evidence(evidence_output, smoke_evidence)
     if raw:
         print_json(
             {
@@ -122,6 +176,8 @@ def smoke(
                     "trace_id",
                 ),
                 "support_receipt": support_receipt,
+                "dashboard_urls": dashboard_urls,
+                "evidence": smoke_evidence,
             }
         )
         return
@@ -151,10 +207,16 @@ def smoke(
         )
         if structured:
             rows.append(["Output Format", "json_schema"])
+        if dashboard_urls.get("observability_url"):
+            rows.append(["Dashboard", dashboard_urls["observability_url"]])
+        if evidence_output is not None:
+            rows.append(["Evidence", evidence_output])
     table("Smoke", ["Check", "Value"], rows)
     if isinstance(response, dict):
         panel("Output", _response_output_text(response) or "<empty>")
         panel("Support receipt", json.dumps(support_receipt, indent=2, sort_keys=True))
+    if evidence_output is not None:
+        print_success(f"Wrote smoke evidence to {evidence_output}.")
 
 
 def _correlation_headers(
@@ -182,6 +244,21 @@ def _metadata_pairs(values: list[str]) -> dict[str, str]:
             raise typer.BadParameter("--metadata values must use key=value.")
         parsed[key.strip()] = value
     return parsed
+
+
+def _support_bundle_params(
+    *,
+    trace_id: object,
+    response_id: object,
+    user_id: str,
+) -> dict[str, object]:
+    """Build bounded support-bundle filters for a smoke turn."""
+    params: dict[str, object] = {"limit": 25, "user_id": user_id}
+    if trace_id:
+        params["trace_id"] = str(trace_id)
+    if response_id:
+        params["response_id"] = str(response_id)
+    return params
 
 
 def _load_schema(path: Path) -> dict[str, Any]:
@@ -278,3 +355,69 @@ def _support_receipt(
         "cost_usd": _metadata_value(metadata, "general_augment_cost_usd", "cost_usd"),
         "ready_status": _status_text(ready),
     }
+
+
+def _dashboard_evidence_urls(
+    *,
+    project: dict[str, Any] | None,
+    trace_id: object,
+    response_id: object,
+    user_id: str,
+) -> dict[str, str | None]:
+    """Build dashboard URLs that let operators review smoke evidence quickly."""
+    project_ref = None
+    if project:
+        project_ref = str(project.get("slug") or project.get("id") or "")
+    params: dict[str, str] = {}
+    if trace_id:
+        params["trace_id"] = str(trace_id)
+    if response_id:
+        params["response_id"] = str(response_id)
+    if user_id:
+        params["user_id"] = user_id
+    query = urlencode(params)
+    observability_url = (
+        f"{DEFAULT_DASHBOARD_URL}/dashboard/observability?{query}"
+        if query
+        else f"{DEFAULT_DASHBOARD_URL}/dashboard/observability"
+    )
+    return {
+        "project_url": dashboard_project_url(project_ref) if project_ref else None,
+        "observability_url": observability_url,
+    }
+
+
+def _smoke_evidence(
+    *,
+    ready: object,
+    response: object,
+    support_receipt: dict[str, object],
+    dashboard_urls: dict[str, str | None],
+    support_bundle: dict[str, Any] | None,
+) -> dict[str, object]:
+    """Create the redacted smoke evidence artifact."""
+    response_payload = response if isinstance(response, dict) else {}
+    return {
+        "schema_version": "general-augment-smoke-evidence/v1",
+        "generated_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "ready": ready,
+        "response": {
+            "id": response_payload.get("id"),
+            "status": response_payload.get("status"),
+            "model": response_payload.get("model"),
+        },
+        "support_receipt": support_receipt,
+        "dashboard_urls": dashboard_urls,
+        "support_bundle": support_bundle,
+        "security": {
+            "raw_secrets_included": False,
+            "raw_provider_credentials_included": False,
+            "raw_response_payload_included": False,
+        },
+    }
+
+
+def _write_evidence(path: Path, evidence: dict[str, object]) -> None:
+    """Write redacted smoke evidence to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
