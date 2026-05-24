@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated
 
@@ -9,11 +10,33 @@ import typer
 
 from platform_cli.errors import CLIError
 from platform_cli.openapi import scaffold_basic_agent
-from platform_cli.output import print_success, print_warning, table
+from platform_cli.output import print_json, print_success, print_warning, table
+from platform_cli.runtime import Runtime
+from platform_cli.self_serve import build_setup_payload, write_payload
 
 
 def init(
-    name: Annotated[str, typer.Argument(help="Agent/project name, such as dayplan.")],
+    ctx: typer.Context,
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Agent/project name for scaffold mode, such as dayplan."),
+    ] = None,
+    workspace: Annotated[
+        Path,
+        typer.Option(help="Existing app workspace to inspect when NAME is omitted."),
+    ] = Path("."),
+    capability: Annotated[
+        list[str] | None,
+        typer.Option("--capability", help="Capability to configure when NAME is omitted."),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write setup plan JSON when NAME is omitted."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print setup plan JSON when NAME is omitted."),
+    ] = False,
     output_dir: Annotated[Path | None, typer.Option(help="Output directory.")] = None,
     display_name: Annotated[str | None, typer.Option(help="Tenant-facing display name.")] = None,
     description: Annotated[
@@ -26,7 +49,35 @@ def init(
     ] = None,
     force: Annotated[bool, typer.Option(help="Overwrite existing starter files.")] = False,
 ) -> None:
-    """Create a starter genaug-agent.yaml workspace without an OpenAPI spec."""
+    """Create a starter agent scaffold, or inspect an existing app when NAME is omitted."""
+    if name is None:
+        runtime: Runtime = ctx.obj
+        payload = build_setup_payload(
+            workspace=workspace,
+            config=runtime.config,
+            requested_capabilities=capability or [],
+        )
+        artifact_path = write_payload(payload, output, workspace)
+        payload["artifact_path"] = str(artifact_path)
+        artifact_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        if json_output:
+            print_json(payload)
+            return
+        table(
+            "General Augment setup plan",
+            ["Field", "Value"],
+            [
+                ["Workspace", payload["workspace"]["root"]],
+                ["Frameworks", ", ".join(payload["detected"]["frameworks"])],
+                ["Auth", payload["auth"]["status"]],
+                ["Artifact", artifact_path],
+            ],
+        )
+        print_success("Setup plan written without changing app code or storing secrets.")
+        return
     try:
         result = scaffold_basic_agent(
             name=name,

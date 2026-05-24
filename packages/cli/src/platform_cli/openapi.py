@@ -25,10 +25,13 @@ VALID_MODEL_PREFIXES = (
     "openai/",
 )
 TOOL_DISCOVERY_MODES = {"auto", "always", "direct"}
-DEFAULT_TOOL_DISCOVERY: dict[str, int | str] = {
+DEFAULT_TOOL_DISCOVERY: dict[str, Any] = {
     "mode": "auto",
     "direct_schema_tool_limit": 10,
     "max_search_results": 5,
+    "native_hermes_toolsets": [],
+    "allow_runtime_skill_writes": False,
+    "hermes_runtime": {},
 }
 SENSITIVE_KEY_MARKERS = ("auth", "authorization", "api_key", "apikey", "key", "secret", "token")
 SECRET_PLACEHOLDER_RE = re.compile(r"\$\{\{\s*(secrets|credentials)\.[A-Za-z0-9_.-]+\s*\}\}")
@@ -612,7 +615,7 @@ def _validate_skills(
     return skills_dir, skill_count
 
 
-def _validate_behavior(behavior: object, errors: list[str]) -> dict[str, int | str]:
+def _validate_behavior(behavior: object, errors: list[str]) -> dict[str, Any]:
     """Validate behavior controls and return normalized tool discovery."""
     if behavior is None:
         return dict(DEFAULT_TOOL_DISCOVERY)
@@ -633,7 +636,7 @@ def _validate_behavior(behavior: object, errors: list[str]) -> dict[str, int | s
     return _validate_tool_discovery(behavior.get("tool_discovery"), errors)
 
 
-def _validate_tool_discovery(value: object, errors: list[str]) -> dict[str, int | str]:
+def _validate_tool_discovery(value: object, errors: list[str]) -> dict[str, Any]:
     """Validate local tool discovery config."""
     if value is None:
         return dict(DEFAULT_TOOL_DISCOVERY)
@@ -661,11 +664,110 @@ def _validate_tool_discovery(value: object, errors: list[str]) -> dict[str, int 
             "behavior.tool_discovery.max_search_results must be less than or equal to 10."
         )
         max_results = 10
+    native_toolsets = _string_list(
+        value.get("native_hermes_toolsets"),
+        field_name="behavior.tool_discovery.native_hermes_toolsets",
+        errors=errors,
+    )
+    allow_runtime_skill_writes = _optional_bool(
+        value.get("allow_runtime_skill_writes"),
+        field_name="behavior.tool_discovery.allow_runtime_skill_writes",
+        errors=errors,
+    )
+    hermes_runtime = _validate_hermes_runtime(
+        value.get("hermes_runtime"),
+        errors=errors,
+    )
     return {
         "mode": mode,
         "direct_schema_tool_limit": direct_limit,
         "max_search_results": max_results,
+        "native_hermes_toolsets": native_toolsets,
+        "allow_runtime_skill_writes": allow_runtime_skill_writes,
+        "hermes_runtime": hermes_runtime,
     }
+
+
+def _validate_hermes_runtime(value: object, *, errors: list[str]) -> dict[str, Any]:
+    """Validate bounded Hermes constructor options from local config."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        errors.append("behavior.tool_discovery.hermes_runtime must be an object.")
+        return {}
+    runtime: dict[str, Any] = {}
+    for field_name in (
+        "session_db_enabled",
+        "pass_session_id",
+        "checkpoints_enabled",
+        "provider_require_parameters",
+    ):
+        parsed = _optional_bool(
+            value.get(field_name),
+            field_name=f"behavior.tool_discovery.hermes_runtime.{field_name}",
+            errors=errors,
+        )
+        if parsed:
+            runtime[field_name] = parsed
+    if "checkpoint_max_snapshots" in value:
+        runtime["checkpoint_max_snapshots"] = _positive_int_or_default(
+            value.get("checkpoint_max_snapshots"),
+            default=50,
+            field_name="behavior.tool_discovery.hermes_runtime.checkpoint_max_snapshots",
+            errors=errors,
+        )
+    for field_name in ("providers_allowed", "providers_ignored", "providers_order"):
+        values = _string_list(
+            value.get(field_name),
+            field_name=f"behavior.tool_discovery.hermes_runtime.{field_name}",
+            errors=errors,
+        )
+        if values:
+            runtime[field_name] = values
+    for field_name in ("provider_sort", "provider_data_collection"):
+        if field_name in value:
+            raw = value.get(field_name)
+            if isinstance(raw, str) and raw.strip():
+                runtime[field_name] = raw.strip()
+            else:
+                errors.append(
+                    f"behavior.tool_discovery.hermes_runtime.{field_name} "
+                    "must be a non-empty string."
+                )
+    prefill = value.get("prefill_messages")
+    if prefill is not None:
+        if not isinstance(prefill, list):
+            errors.append(
+                "behavior.tool_discovery.hermes_runtime.prefill_messages must be a list."
+            )
+        else:
+            runtime["prefill_messages"] = [
+                item
+                for item in prefill
+                if isinstance(item, dict)
+                and isinstance(item.get("role"), str)
+                and isinstance(item.get("content"), str)
+            ]
+    fallback_models = value.get("fallback_models")
+    if fallback_models is not None:
+        if not isinstance(fallback_models, list):
+            errors.append(
+                "behavior.tool_discovery.hermes_runtime.fallback_models must be a list."
+            )
+        else:
+            runtime["fallback_models"] = [
+                {
+                    "provider": str(item.get("provider")).strip(),
+                    "model": str(item.get("model")).strip(),
+                }
+                for item in fallback_models[:3]
+                if isinstance(item, dict)
+                and isinstance(item.get("provider"), str)
+                and item.get("provider", "").strip()
+                and isinstance(item.get("model"), str)
+                and item.get("model", "").strip()
+            ]
+    return runtime
 
 
 def _validate_channels(channels: object, warnings: list[str]) -> None:
@@ -908,9 +1010,12 @@ Paste this into the coding agent that owns your app backend.
 You are integrating our app backend with General Augment.
 
 Goal:
+- Treat General Augment as the app's managed agent backend for app-owned agent turns.
 - Keep General Augment API keys server-side only.
 - Use our app's stable signed-in user id as the Responses API `user` value.
 - Call `POST /v1/responses` from the backend, never from browser or mobile code.
+- Start with one backend `/v1/responses` route; add memory, tools, channels, and
+  identity linking after the first turn works.
 - Add app APIs as governed tools only through approved OpenAPI or MCP registration.
 - Keep write actions approval-required and destructive actions disabled until reviewed.
 - Prove the setup with CLI smoke and verify before production traffic.
@@ -933,28 +1038,35 @@ Implementation steps:
    # Use `genaug` below for an installed CLI, or prefix commands with
    # `uv run --project packages/cli` from the repo checkout.
 2. Authenticate and diagnose:
+   genaug setup --capability browse --json
    genaug auth login --api-key "$GENAUG_API_KEY" --base-url "$GENAUG_API_BASE_URL"
    genaug doctor --json
    genaug auth whoami
-3. Review this scaffold:
-   - genaug-agent.yaml
-   - SOUL.md
-   - skills/
-   - tools/
-4. Deploy the scaffold:
-   genaug deploy ./genaug-agent.yaml
-5. Wire the backend helper:
+3. If the app already uses OpenAI Responses, generate a reviewable migration diff:
+   genaug migrate openai-responses --dry-run --json
+   # Apply only after review:
+   genaug migrate openai-responses --apply
+4. Wire the backend helper first:
    - POST "$GENAUG_API_BASE_URL/v1/responses"
    - Authorization: Bearer $GENAUG_API_KEY
    - Body includes model, user, input, metadata.feature, and metadata.trace_id.
    - Store returned response id and metadata.general_augment_trace_id in app logs.
-6. Add explicit memory only for durable facts:
+   - Handle 402 as a budget/setup blocker and 429 with bounded retry plus Retry-After.
+5. Review this scaffold:
+   - genaug-agent.yaml
+   - SOUL.md
+   - skills/
+   - tools/
+6. Deploy the scaffold when local policy looks right:
+   genaug deploy ./genaug-agent.yaml
+7. Add explicit memory only for durable facts:
    - POST /api/v1/agent/memory/store with user_id matching the Responses `user`.
    - Search/profile/delete memory through the server-side project key only.
-7. Verify before launch:
+8. Verify before launch:
    genaug smoke --project {slug} --message "Reply exactly with: ok" --json
    genaug verify --project {slug} --json
    genaug onboarding verify --project {slug} --json
+   genaug dashboard open --project {slug}
 
 Do not:
 - Commit API keys.
@@ -1025,6 +1137,16 @@ def _is_sensitive_key(value: str) -> bool:
 def _positive_int_value(value: object) -> bool:
     """Return whether a value is a positive integer."""
     return not isinstance(value, bool) and isinstance(value, int) and value >= 1
+
+
+def _optional_bool(value: object, *, field_name: str, errors: list[str]) -> bool:
+    """Return an optional boolean or record a validation error."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    errors.append(f"{field_name} must be a boolean.")
+    return False
 
 
 def _positive_int_or_default(

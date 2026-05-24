@@ -57,6 +57,108 @@ def get_trace(
     )
 
 
+@app.command("runs")
+def list_runs(
+    ctx: typer.Context,
+    project: Annotated[str, typer.Option(help="Project id, slug, or name.")],
+    response_id: Annotated[
+        str | None,
+        typer.Option("--response-id", help="Filter by Responses API response id."),
+    ] = None,
+    trace_id: Annotated[
+        str | None,
+        typer.Option("--trace-id", help="Filter by General Augment trace id."),
+    ] = None,
+    status: Annotated[
+        str | None,
+        typer.Option(help="Filter by durable run status."),
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1, max=200, help="Maximum runs to fetch.")] = 50,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print machine-readable JSON."),
+    ] = False,
+) -> None:
+    """List durable agent runs for one project."""
+    runtime: Runtime = ctx.obj
+    with runtime.client() as client:
+        project_payload = resolve_project(client, project)
+        response = client.admin(
+            "GET",
+            f"/projects/{encode_path_segment(str(project_payload['id']))}/runs",
+            params=_support_params(
+                limit=limit,
+                response_id=response_id,
+                trace_id=trace_id,
+                status=status,
+            ),
+        )
+    if json_output:
+        print_json(response)
+        return
+    items = response.get("items", []) if isinstance(response, dict) else []
+    table(
+        "Agent runs",
+        ["Run", "Status", "Response", "Trace", "Model", "Latency"],
+        [
+            [
+                _value(item, "id"),
+                _value(item, "status"),
+                _value(item, "response_id"),
+                _value(item, "trace_id"),
+                _value(item, "model_used"),
+                _value(item, "latency_ms"),
+            ]
+            for item in items
+            if isinstance(item, dict)
+        ],
+    )
+
+
+@app.command("run")
+def get_run(
+    ctx: typer.Context,
+    run_id: Annotated[str, typer.Argument(help="Durable General Augment run id.")],
+    project: Annotated[str, typer.Option(help="Project id, slug, or name.")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print machine-readable JSON."),
+    ] = False,
+) -> None:
+    """Fetch one durable agent run with step and event evidence."""
+    runtime: Runtime = ctx.obj
+    with runtime.client() as client:
+        project_payload = resolve_project(client, project)
+        response = client.admin(
+            "GET",
+            (
+                f"/projects/{encode_path_segment(str(project_payload['id']))}/runs/"
+                f"{encode_path_segment(run_id)}"
+            ),
+        )
+    if json_output:
+        print_json(response)
+        return
+    table(
+        "Agent run",
+        ["Field", "Value"],
+        [
+            ["Run", _value(response, "id") or run_id],
+            ["Status", _value(response, "status")],
+            ["Response", _value(response, "response_id")],
+            ["Trace", _value(response, "trace_id")],
+            ["Model", _value(response, "model_used")],
+            ["User", _value(response, "user_id")],
+            ["Session", _value(response, "session_id")],
+            ["Steps", len(response.get("steps", [])) if isinstance(response, dict) else 0],
+            [
+                "Platform Events",
+                len(response.get("platform_events", [])) if isinstance(response, dict) else 0,
+            ],
+        ],
+    )
+
+
 @app.command("support-bundle")
 def support_bundle(
     ctx: typer.Context,

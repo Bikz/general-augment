@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from pathlib import Path
 from typing import Any, ClassVar
@@ -15,6 +16,14 @@ from typer.testing import CliRunner
 from platform_cli.main import app
 
 ROOT = Path(__file__).resolve().parents[3]
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+PLACEHOLDER_MCP_URL = (
+    "https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}"
+)
+RICH_BOX_TRANSLATION = dict.fromkeys(
+    map(ord, ("\u2500", "\u2502", "\u256d", "\u256e", "\u2570", "\u256f")),
+    " ",
+)
 
 
 class FakeHTTPClient:
@@ -46,6 +55,13 @@ class FakeHTTPClient:
 
     def close(self) -> None:
         """Close fake client."""
+
+
+def plain_cli_output(result: Any) -> str:
+    """Return CLI output without ANSI or Rich box wrapping artifacts."""
+    output = ANSI_RE.sub("", str(result.output))
+    output = output.translate(RICH_BOX_TRANSLATION)
+    return " ".join(output.split())
 
 
 @pytest.fixture(autouse=True)
@@ -91,6 +107,470 @@ def test_auth_login_logout_whoami(tmp_path: Path) -> None:
     assert FakeHTTPClient.requests[1]["url"] == "http://api.test/api/v1/admin/me"
     assert logout.exit_code == 0
     assert not config_path.exists()
+
+
+def test_auth_login_browser_flow_stores_installer_session_without_printing_tokens(
+    tmp_path: Path,
+) -> None:
+    """Browser login should exchange an installer code and keep tokens out of output."""
+    config_path = tmp_path / "config.yaml"
+    runner = CliRunner()
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "request_id": "req_1",
+                "authorize_url": "https://app.generalaugment.com/cli/authorize?request_id=req_1",
+                "expires_at": "2026-05-23T19:30:00Z",
+                "scopes": ["projects:write", "runtime_keys:create"],
+            }
+        ),
+        json_response(
+            {
+                "token_type": "Bearer",
+                "access_token": "gainst_access_secret",
+                "refresh_token": "garefr_refresh_secret",
+                "expires_at": "2026-05-23T20:30:00Z",
+                "scopes": ["projects:write", "runtime_keys:create"],
+                "project_id": "proj/1",
+            }
+        ),
+        json_response(
+            {
+                "auth_method": "installer",
+                "clerk_user_id": "user_123",
+                "clerk_email": "dev@example.com",
+                "scopes": ["projects:write", "runtime_keys:create"],
+                "project_id": "proj/1",
+                "project_ids": ["proj/1"],
+            }
+        ),
+    ]
+
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "auth",
+            "login",
+            "--base-url",
+            "http://api.test",
+            "--no-browser",
+            "--authorization-code",
+            "gacode_once",
+            "--code-verifier",
+            "verifier",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "gainst_access_secret" not in result.output
+    assert "garefr_refresh_secret" not in result.output
+    assert "Browser authorization started" in result.output
+    assert FakeHTTPClient.requests[0]["url"] == (
+        "http://api.test/api/v1/installer/auth/browser/start"
+    )
+    assert FakeHTTPClient.requests[0]["headers"] == {}
+    assert FakeHTTPClient.requests[1]["url"] == "http://api.test/api/v1/installer/auth/token"
+    assert FakeHTTPClient.requests[2]["headers"] == {
+        "Authorization": "Bearer gainst_access_secret"
+    }
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config["api_key"] is None
+    assert config["metadata"]["installer"]["access_token"] == "gainst_access_secret"
+    assert config["metadata"]["installer"]["refresh_token"] == "garefr_refresh_secret"
+
+
+def test_setup_bootstrap_uses_installer_session_without_storing_runtime_secret(
+    tmp_path: Path,
+) -> None:
+    """Setup bootstrap should create tenant resources without persisting raw runtime keys."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": None,
+                "metadata": {
+                    "installer": {
+                        "access_token": "gainst_access_secret",
+                        "refresh_token": "garefr_refresh_secret",
+                        "scopes": ["projects:read", "projects:write", "runtime_keys:create"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    artifact_path = tmp_path / "setup-plan.json"
+    FakeHTTPClient.queue = [
+        json_response({"items": []}),
+        json_response({"id": "proj_1", "name": "Demo App", "slug": "demo-app"}),
+        json_response(
+            {
+                "id": "key_1",
+                "name": "Self-serve app backend",
+                "api_key": "ga_runtime_secret_once",
+                "masked_key": "ga...once",
+                "project_id": "proj_1",
+                "scopes": ["responses:create"],
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "setup",
+            "--workspace",
+            str(workspace),
+            "--bootstrap",
+            "--project-name",
+            "Demo App",
+            "--project-slug",
+            "demo-app",
+            "--output",
+            str(artifact_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "ga_runtime_secret_once" not in result.output
+    payload = json.loads(result.output)
+    assert payload["auth"]["method"] == "installer"
+    assert payload["target"]["project_ref"] == "proj_1"
+    assert payload["bootstrap"] == {
+        "applied": True,
+        "project": {"id": "proj_1", "name": "Demo App", "slug": "demo-app"},
+        "runtime_key": {
+            "id": "key_1",
+            "name": "Self-serve app backend",
+            "masked_key": "ga...once",
+            "project_id": "proj_1",
+            "scopes": ["responses:create"],
+        },
+    }
+    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/installer/projects"
+    assert FakeHTTPClient.requests[0]["headers"] == {
+        "Authorization": "Bearer gainst_access_secret"
+    }
+    assert FakeHTTPClient.requests[1]["method"] == "POST"
+    assert FakeHTTPClient.requests[1]["json"]["slug"] == "demo-app"
+    assert FakeHTTPClient.requests[2]["url"] == (
+        "http://api.test/api/v1/installer/projects/proj_1/runtime-keys"
+    )
+    persisted_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted_config["active_project"] == "proj_1"
+    assert "ga_runtime_secret_once" not in config_path.read_text(encoding="utf-8")
+    assert "ga_runtime_secret_once" not in artifact_path.read_text(encoding="utf-8")
+
+
+def test_setup_bootstrap_can_print_runtime_env_once_without_artifact_secret(
+    tmp_path: Path,
+) -> None:
+    """Explicit env output should show the runtime key once without persisting it."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": None,
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    FakeHTTPClient.queue = [
+        json_response({"items": []}),
+        json_response({"id": "proj_1", "name": "Demo App", "slug": "demo-app"}),
+        json_response(
+            {
+                "id": "key_1",
+                "name": "Self-serve app backend",
+                "api_key": "ga_runtime_secret_once",
+                "masked_key": "ga...once",
+                "project_id": "proj_1",
+                "scopes": ["responses:create"],
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "setup",
+            "--workspace",
+            str(workspace),
+            "--bootstrap",
+            "--project-name",
+            "Demo App",
+            "--project-slug",
+            "demo-app",
+            "--print-env",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "GENAUG_API_KEY=ga_runtime_secret_once" in result.output
+    artifact = workspace / ".genaug" / "setup-plan.json"
+    assert artifact.exists()
+    assert "ga_runtime_secret_once" not in artifact.read_text(encoding="utf-8")
+    assert "ga_runtime_secret_once" not in config_path.read_text(encoding="utf-8")
+
+
+def test_providers_setup_writes_installer_custody_and_health_checks(
+    tmp_path: Path,
+) -> None:
+    """Provider setup should store BYO keys in GA custody without echoing secrets."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": None,
+                "active_project": "proj_1",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "provider": "browserbase",
+                "label": "Browserbase provider",
+                "credential_kind": "external_mcp_provider",
+                "status": "active",
+                "base_url_configured": True,
+                "created_at": "2026-05-23T19:30:00Z",
+                "updated_at": "2026-05-23T19:30:00Z",
+                "last_validated_at": None,
+            }
+        ),
+        json_response(
+            {
+                "provider": "browserbase",
+                "credential_kind": "external_mcp_provider",
+                "status": "available",
+                "message": "Browserbase credential is configured.",
+                "checked_at": "2026-05-23T19:31:00Z",
+                "latency_ms": 12,
+                "status_code": 200,
+                "retryable": False,
+                "last_validated_at": "2026-05-23T19:31:00Z",
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "providers",
+            "setup",
+            "--capability",
+            "browse",
+            "--project",
+            "proj_1",
+            "--api-key",
+            "bb_secret_raw",
+            "--health-check",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "bb_secret_raw" not in result.output
+    payload = json.loads(result.output)
+    assert payload["providers"][0]["provider"] == "browserbase"
+    assert payload["providers"][0]["credential"]["status"] == "active"
+    assert payload["providers"][0]["health"]["status"] == "available"
+    assert FakeHTTPClient.requests[0]["method"] == "PUT"
+    assert FakeHTTPClient.requests[0]["url"] == (
+        "http://api.test/api/v1/installer/projects/proj_1/capability-providers/browserbase"
+    )
+    assert FakeHTTPClient.requests[0]["headers"] == {
+        "Authorization": "Bearer gainst_access_secret"
+    }
+    assert FakeHTTPClient.requests[0]["json"]["api_key"] == "bb_secret_raw"
+    assert FakeHTTPClient.requests[1]["method"] == "POST"
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/installer/projects/proj_1/capability-providers/browserbase/health-check"
+    )
+
+
+def test_skills_design_can_push_starter_bundle_with_installer_auth(tmp_path: Path) -> None:
+    """Skill design should optionally push SKILL.md and prompt flow drafts."""
+    config_path = tmp_path / "config.yaml"
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": None,
+                "active_project": "proj_1",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "name": "Website Builder",
+                "content": "# Website Builder",
+                "metadata": {"description": "Build, review, and prepare website previews."},
+            }
+        ),
+        json_response(
+            {
+                "id": "flow_row_1",
+                "project_id": "proj_1",
+                "flow_id": "website_builder",
+                "version_id": "website-builder:v1",
+                "name": "Website Builder",
+                "status": "draft",
+                "graph": {"id": "website_builder", "nodes": [{"id": "intake"}]},
+                "compiled_snapshot": {},
+                "created_at": "2026-05-23T19:40:00Z",
+                "updated_at": "2026-05-23T19:40:00Z",
+                "published_at": None,
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "skills",
+            "design",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "proj_1",
+            "--apply",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["applied"]["skill"]["name"] == "Website Builder"
+    assert payload["applied"]["prompt_flow"]["flow_id"] == "website_builder"
+    assert FakeHTTPClient.requests[0]["method"] == "POST"
+    assert FakeHTTPClient.requests[0]["url"] == (
+        "http://api.test/api/v1/installer/projects/proj_1/skills"
+    )
+    assert "Build safe website previews" in FakeHTTPClient.requests[0]["json"]["content"]
+    assert FakeHTTPClient.requests[0]["headers"] == {
+        "Authorization": "Bearer gainst_access_secret"
+    }
+    assert FakeHTTPClient.requests[1]["method"] == "PUT"
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/installer/projects/proj_1/prompt-flows/website_builder"
+    )
+
+
+def test_connectors_setup_can_push_mcp_server_with_installer_auth(tmp_path: Path) -> None:
+    """Connector setup should add MCP servers through installer-scoped setup auth."""
+    config_path = tmp_path / "config.yaml"
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": None,
+                "active_project": "proj_1",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "name": "browserbase",
+                "url": PLACEHOLDER_MCP_URL,
+                "tools": {"include": ["browser_navigate"]},
+                "enabled": True,
+            }
+        ),
+        json_response({"name": "browserbase", "ok": True, "transport": "http", "detail": None}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "connectors",
+            "setup",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "proj_1",
+            "--name",
+            "browserbase",
+            "--url",
+            PLACEHOLDER_MCP_URL,
+            "--include-tool",
+            "browser_navigate",
+            "--health-check",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["applied"]["server"]["name"] == "browserbase"
+    assert payload["applied"]["health"]["ok"] is True
+    assert FakeHTTPClient.requests[0]["method"] == "POST"
+    assert FakeHTTPClient.requests[0]["url"] == (
+        "http://api.test/api/v1/installer/projects/proj_1/mcp-servers"
+    )
+    assert FakeHTTPClient.requests[0]["headers"] == {
+        "Authorization": "Bearer gainst_access_secret"
+    }
+    assert FakeHTTPClient.requests[0]["json"]["tools"] == {"include": ["browser_navigate"]}
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/installer/projects/proj_1/mcp-servers/browserbase/test"
+    )
+
+
+def test_connectors_setup_rejects_raw_url_query_secrets(tmp_path: Path) -> None:
+    """Connector setup must not store raw provider keys in MCP URLs."""
+    config_path = write_config(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "connectors",
+            "setup",
+            "--name",
+            "browserbase",
+            "--url",
+            "https://mcp.browserbase.com/mcp?api_key=bb_secret_raw",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "credential placeholder" in plain_cli_output(result)
+    assert FakeHTTPClient.requests == []
 
 
 def test_auth_login_fails_without_saving_invalid_key(tmp_path: Path) -> None:
@@ -150,7 +630,7 @@ def test_version_flag_exposes_cli_package_version() -> None:
     result = CliRunner().invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert "genaug 0.1.0" in result.output
+    assert "genaug 0.1.1" in result.output
 
 
 def test_mock_command_runs_shared_local_mock(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -299,6 +779,31 @@ def test_local_mock_returns_project_soul_content() -> None:
         "project_id": project["id"],
         "content": "# DayPlan\n\nUse concise onboarding notes.",
     }
+
+
+def test_evals_run_gate_outputs_machine_readable_verdict(tmp_path: Path) -> None:
+    """Eval CLI should expose the local CI gate verdict for checked-in suites."""
+    artifact_dir = tmp_path / "eval-artifacts"
+    suite_path = ROOT / "tests" / "fixtures" / "agent_evals" / "platform_moat_v1.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "evals",
+            "run",
+            str(suite_path),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--gate",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "PASS"
+    assert payload["suite"]["dataset"]["kind"] == "golden"
+    assert Path(payload["artifact_path"]).exists()
 
 
 def test_local_mock_identity_tracks_project_key() -> None:
@@ -502,7 +1007,7 @@ def test_billing_commands_create_hosted_sessions_and_list_events(tmp_path: Path)
             "--project",
             "dayplan",
             "--tier",
-            "pro",
+            "build",
         ],
     )
     portal = runner.invoke(
@@ -524,7 +1029,7 @@ def test_billing_commands_create_hosted_sessions_and_list_events(tmp_path: Path)
     assert FakeHTTPClient.requests[1]["url"].endswith(
         "/api/v1/admin/projects/proj%2F1/billing/checkout-session"
     )
-    assert FakeHTTPClient.requests[1]["json"] == {"target_tier": "pro"}
+    assert FakeHTTPClient.requests[1]["json"] == {"target_tier": "build"}
     assert FakeHTTPClient.requests[3]["method"] == "POST"
     assert FakeHTTPClient.requests[3]["url"].endswith(
         "/api/v1/admin/projects/proj%2F1/billing/portal-session"
@@ -553,6 +1058,276 @@ def test_billing_events_json_is_machine_readable(tmp_path: Path) -> None:
     assert json.loads(result.output)["items"][0]["event_type"] == "checkout.session.completed"
 
 
+def test_billing_status_shows_credit_balance_and_auto_top_up_state(tmp_path: Path) -> None:
+    """Billing status should expose credit balance and funding state from admin APIs."""
+    config_path = write_config(tmp_path)
+    project = {
+        "id": "proj/1",
+        "name": "DayPlan",
+        "slug": "dayplan",
+        "status": "active",
+        "pricing_tier": "build",
+        "plan": "build",
+        "rate_limits": {"funding_mode": "subscription_included"},
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "project_id": "proj/1",
+                "active_balance_usd": "24.500000",
+                "grants": [{"id": "grant-1"}, {"id": "grant-2"}],
+                "reservations": [{"id": "reservation-1"}],
+                "ledger_entries": [{"id": "ledger-1"}],
+            }
+        ),
+        json_response(
+            {
+                "enabled": True,
+                "threshold_usd": "5.000000",
+                "top_up_amount_usd": "25.000000",
+                "monthly_cap_usd": "100.000000",
+                "payment_method_status": "ready",
+                "charge_attempts_enabled": False,
+                "last_triggered_at": "2026-05-09T12:00:00Z",
+            }
+        ),
+        json_response(
+            {"items": [{"status": "blocked", "failure_code": "charge_attempts_disabled"}]}
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "billing", "status", "--project", "dayplan"],
+    )
+
+    assert result.exit_code == 0
+    assert "Billing status for dayplan" in result.output
+    assert "24.500000" in result.output
+    assert "subscription_included" in result.output
+    assert "enabled, charges disabled" in result.output
+    assert "charge_attempts_disabled" in result.output
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/billing/credits"
+    )
+    assert FakeHTTPClient.requests[2]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/billing/credits/auto-top-up"
+    )
+    assert FakeHTTPClient.requests[3]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/billing/credits/auto-top-up/attempts"
+    )
+
+
+def test_billing_top_up_creates_credit_checkout_session(tmp_path: Path) -> None:
+    """Billing top-up should create a hosted paid-credit Checkout session."""
+    config_path = write_config(tmp_path)
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response({"url": "https://checkout.stripe.com/session/top-up"}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "billing",
+            "top-up",
+            "--project",
+            "dayplan",
+            "--amount-usd",
+            "25.00",
+            "--save-payment-method",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "top-up checkout session" in result.output
+    assert "checkout.stripe.com" in result.output
+    assert FakeHTTPClient.requests[1]["method"] == "POST"
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/billing/credits/top-up-checkout-session"
+    )
+    assert FakeHTTPClient.requests[1]["json"] == {
+        "amount_usd": "25.00",
+        "save_payment_method": True,
+    }
+
+
+def test_billing_usage_json_exposes_usage_endpoint(tmp_path: Path) -> None:
+    """Billing usage should expose machine-readable usage rollups for reconciliation."""
+    config_path = write_config(tmp_path)
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "totals": {"agent_turns_count": 7, "total_cost_usd": 1.23},
+                "days": [{"date": "2026-05-09", "agent_turns_count": 7}],
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "billing",
+            "usage",
+            "--project",
+            "dayplan",
+            "--start-date",
+            "2026-05-01",
+            "--end-date",
+            "2026-05-09",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["usage"]["totals"]["agent_turns_count"] == 7
+    assert payload["project"]["slug"] == "dayplan"
+    assert FakeHTTPClient.requests[1]["method"] == "GET"
+    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/usage")
+    assert FakeHTTPClient.requests[1]["params"] == {
+        "start_date": "2026-05-01",
+        "end_date": "2026-05-09",
+    }
+
+
+def test_billing_verify_json_proves_credit_gate_and_metered_platform_ledger(
+    tmp_path: Path,
+) -> None:
+    """Billing verify should prove platform-funded work has credit guardrails."""
+    config_path = write_config(tmp_path)
+    project = {
+        "id": "proj/1",
+        "name": "DayPlan",
+        "slug": "dayplan",
+        "status": "active",
+        "rate_limits": {
+            "credit_billing_enabled": True,
+            "funding_mode": "subscription_included",
+        },
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "project_id": "proj/1",
+                "active_balance_usd": "12.500000",
+                "ledger_entries": [
+                    {
+                        "event_type": "agent_turn_reserved",
+                        "provider_source": "platform",
+                        "reservation_id": "reservation-1",
+                    },
+                    {
+                        "event_type": "agent_turn_completed",
+                        "provider_source": "platform",
+                        "reservation_id": "reservation-1",
+                    },
+                ],
+                "reservations": [{"id": "reservation-1", "status": "settled"}],
+            }
+        ),
+        json_response({"totals": {"agent_turns_count": 3, "total_cost_usd": "0.09"}}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "billing", "verify", "--project", "dayplan", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "PASS"
+    assert {check["name"]: check["status"] for check in payload["checks"]} == {
+        "credit_billing_enabled": "PASS",
+        "funding_mode_declared": "PASS",
+        "credit_balance_reachable": "PASS",
+        "platform_ledger_metered": "PASS",
+        "usage_rollup_reachable": "PASS",
+    }
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/billing/credits"
+    )
+    assert FakeHTTPClient.requests[1]["params"] == {"limit": 500}
+    assert FakeHTTPClient.requests[2]["url"].endswith("/api/v1/admin/projects/proj%2F1/usage")
+
+
+def test_billing_verify_fails_when_credit_billing_gate_is_disabled(tmp_path: Path) -> None:
+    """Billing verify should fail closed when platform credit billing is disabled."""
+    config_path = write_config(tmp_path)
+    project = {
+        "id": "proj/1",
+        "name": "DayPlan",
+        "slug": "dayplan",
+        "status": "active",
+        "rate_limits": {"funding_mode": "subscription_included"},
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response({"project_id": "proj/1", "active_balance_usd": "0", "ledger_entries": []}),
+        json_response({"totals": {}}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "billing", "verify", "--project", "dayplan"],
+    )
+
+    assert result.exit_code != 0
+    assert "Billing verification failed: credit_billing_enabled" in result.output
+
+
+def test_billing_verify_fails_when_platform_ledger_lacks_reservation(
+    tmp_path: Path,
+) -> None:
+    """Billing verify should flag platform-funded ledger rows without reservation linkage."""
+    config_path = write_config(tmp_path)
+    project = {
+        "id": "proj/1",
+        "name": "DayPlan",
+        "slug": "dayplan",
+        "status": "active",
+        "rate_limits": {
+            "credit_billing_enabled": True,
+            "funding_mode": "subscription_included",
+        },
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "project_id": "proj/1",
+                "active_balance_usd": "3.000000",
+                "ledger_entries": [
+                    {
+                        "event_type": "agent_turn_completed",
+                        "provider_source": "platform",
+                    }
+                ],
+            }
+        ),
+        json_response({"totals": {"agent_turns_count": 1}}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "billing", "verify", "--project", "dayplan", "--json"],
+    )
+
+    assert result.exit_code != 0
+    assert "platform_ledger_metered" in result.output
+    assert '"verdict": "FAIL"' in result.output
+    assert "platform ledger rows without reservation_id: agent_turn_completed" in result.output
+
+
 def test_billing_checkout_rejects_unknown_tier_before_http(tmp_path: Path) -> None:
     """Checkout should only allow configured paid public tiers."""
     config_path = write_config(tmp_path)
@@ -572,7 +1347,7 @@ def test_billing_checkout_rejects_unknown_tier_before_http(tmp_path: Path) -> No
     )
 
     assert result.exit_code != 0
-    assert "Paid target tier must be 'pro' or 'team'" in result.output
+    assert "Paid target tier must be 'build', 'pro', or 'team'" in result.output
     assert FakeHTTPClient.requests == []
 
 
@@ -754,6 +1529,8 @@ def test_integrate_generates_openapi_scaffold(tmp_path: Path) -> None:
     prompt = (output_dir / "CODING_AGENT_PROMPT.md").read_text(encoding="utf-8")
     assert "genaug auth login" in prompt
     assert "uv run --project packages/cli genaug --version" in prompt
+    assert "managed agent backend" in prompt
+    assert "Handle 402 as a budget/setup blocker" in prompt
     assert "genaug verify --project mysti --json" in prompt
     assert "Do not:" in prompt
     agent_config = yaml.safe_load((output_dir / "genaug-agent.yaml").read_text(encoding="utf-8"))
@@ -791,6 +1568,7 @@ def test_init_generates_starter_agent_scaffold(tmp_path: Path) -> None:
     assert (output_dir / "tools/README.md").exists()
     assert (output_dir / "CODING_AGENT_PROMPT.md").exists()
     handoff = (output_dir / "CODING_AGENT_PROMPT.md").read_text(encoding="utf-8")
+    assert "Start with one backend `/v1/responses` route" in handoff
     assert "approved OpenAPI or MCP registration" in handoff
     agent_config = yaml.safe_load((output_dir / "genaug-agent.yaml").read_text(encoding="utf-8"))
     assert agent_config["apiVersion"] == "genaug/v1"
@@ -1136,7 +1914,7 @@ def test_tools_discovery_rejects_invalid_mode(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "--mode must be one of: auto, always, direct" in result.output
+    assert "--mode must be one of: auto, always, direct" in plain_cli_output(result)
     assert FakeHTTPClient.requests == []
 
 
@@ -1214,9 +1992,7 @@ def test_skills_list_view_apply_and_delete(tmp_path: Path) -> None:
     assert deleted.exit_code == 0
     assert "Support Triage" in listed.output
     assert "Route support work." in viewed.output
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/skills"
-    )
+    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/skills")
     assert FakeHTTPClient.requests[3]["url"].endswith(
         "/api/v1/admin/projects/proj%2F1/skills/Support%20Triage"
     )
@@ -1429,14 +2205,10 @@ def test_memory_commands_manage_tenant_user_memory(tmp_path: Path) -> None:
         "fact_type": "preference",
         "source": "tenant-app",
     }
-    assert FakeHTTPClient.requests[5]["url"].endswith(
-        "/api/v1/agent/memory/profile/app-user-1"
-    )
+    assert FakeHTTPClient.requests[5]["url"].endswith("/api/v1/agent/memory/profile/app-user-1")
     assert FakeHTTPClient.requests[7]["url"].endswith("/api/v1/agent/memory/mem%2F1")
     assert FakeHTTPClient.requests[7]["params"] == {"user_id": "app-user-1"}
-    assert FakeHTTPClient.requests[9]["url"].endswith(
-        "/api/v1/agent/memory/user/app-user-1"
-    )
+    assert FakeHTTPClient.requests[9]["url"].endswith("/api/v1/agent/memory/user/app-user-1")
 
 
 def test_memory_json_output_is_machine_readable_with_project_key(tmp_path: Path) -> None:
@@ -1463,9 +2235,7 @@ def test_memory_json_output_is_machine_readable_with_project_key(tmp_path: Path)
     payload = json.loads(result.output)
     assert payload["user_id"] == "app-user-1"
     assert payload["total_facts"] == 0
-    assert FakeHTTPClient.requests[0]["url"].endswith(
-        "/api/v1/agent/memory/profile/app-user-1"
-    )
+    assert FakeHTTPClient.requests[0]["url"].endswith("/api/v1/agent/memory/profile/app-user-1")
     assert "X-Project-ID" not in FakeHTTPClient.requests[0]["headers"]
 
 
@@ -1489,7 +2259,7 @@ def test_memory_store_rejects_unknown_fact_type(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "--fact-type must be one of" in result.output
+    assert "--fact-type must be one of" in plain_cli_output(result)
     assert FakeHTTPClient.requests == []
 
 
@@ -1567,9 +2337,7 @@ def test_mcp_commands_manage_project_servers(tmp_path: Path) -> None:
     }
     assert "True" in tested.output
     assert "Deleted MCP server github" in deleted.output
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/mcp-servers"
-    )
+    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/mcp-servers")
     assert FakeHTTPClient.requests[3]["method"] == "POST"
     assert FakeHTTPClient.requests[3]["json"] == server
     assert FakeHTTPClient.requests[5]["url"].endswith(
@@ -1588,7 +2356,7 @@ def test_mcp_add_rejects_missing_transport(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "Provide exactly one transport: --url or --command" in result.output
+    assert "Provide exactly one transport: --url or --command" in plain_cli_output(result)
     assert FakeHTTPClient.requests == []
 
 
@@ -1614,7 +2382,7 @@ def test_mcp_add_rejects_ambiguous_transport(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "Provide exactly one transport: --url or --command" in result.output
+    assert "Provide exactly one transport: --url or --command" in plain_cli_output(result)
     assert FakeHTTPClient.requests == []
 
 
@@ -1640,7 +2408,7 @@ def test_mcp_add_rejects_malformed_key_value_options(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "--header values must use key=value" in result.output
+    assert "--header values must use key=value" in plain_cli_output(result)
     assert FakeHTTPClient.requests == []
 
 
@@ -1789,7 +2557,7 @@ def test_model_provider_set_rejects_conflicting_secret_sources(tmp_path: Path) -
     )
 
     assert result.exit_code != 0
-    assert "Use only one of --api-key or --api-key-env" in result.output
+    assert "Use only one of --api-key or --api-key-env" in plain_cli_output(result)
     assert FakeHTTPClient.requests == []
 
 
@@ -2169,7 +2937,7 @@ def test_identity_create_test_rejects_malformed_metadata(tmp_path: Path) -> None
     )
 
     assert result.exit_code != 0
-    assert "--metadata values must use key=value" in result.output
+    assert "--metadata values must use key=value" in plain_cli_output(result)
     assert FakeHTTPClient.requests == []
 
 
@@ -2329,7 +3097,7 @@ def test_approval_commands_list_approve_and_deny(tmp_path: Path) -> None:
         "session_id": "session-1",
         "tool_id": "email_send",
         "action_summary": "Send email to person@example.com",
-        "input_summary": "{\"subject\":\"Hello\"}",
+        "input_summary": '{"subject":"Hello"}',
         "channel": "sms",
         "status": "pending",
         "requested_at": "2026-05-05T10:00:00Z",
@@ -2438,8 +3206,169 @@ def test_approval_list_rejects_unknown_status(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "--status must be one of: all, pending" in result.output
+    assert "--status must be one of: all, pending" in plain_cli_output(result)
     assert FakeHTTPClient.requests == []
+
+
+def test_job_commands_cover_lifecycle_and_json_output(tmp_path: Path) -> None:
+    """Scheduled job commands should use admin APIs and emit machine-readable JSON."""
+    config_path = write_config(tmp_path)
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    run = {
+        "id": "run/1",
+        "scheduled_job_id": "job/1",
+        "status": "completed",
+        "scheduled_for": "2026-05-20T12:00:00Z",
+        "attempt_count": 1,
+        "max_attempts": 3,
+        "trace_id": "trace-1",
+        "agent_run_id": "agent-run-1",
+        "dispatch_key": "scheduled:job/1:window",
+    }
+    job = {
+        "id": "job/1",
+        "project_id": "proj/1",
+        "job_type": "agent_turn",
+        "status": "active",
+        "name": "Daily review",
+        "target_app_user_id": "app-user-123",
+        "target_channel": "api",
+        "next_run_at": "2026-05-20T13:00:00Z",
+        "last_run_at": "2026-05-20T12:00:00Z",
+        "retry_history": [run],
+        "linked_run_ids": ["agent-run-1"],
+        "latest_trace_id": "trace-1",
+    }
+    paused = {**job, "status": "paused"}
+    cancelled = {**job, "status": "cancelled", "terminal_reason": "cancelled"}
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(job),
+        json_response({"items": [project]}),
+        json_response({"items": [job]}),
+        json_response({"items": [project]}),
+        json_response(job),
+        json_response({"items": [project]}),
+        json_response({"items": [run]}),
+        json_response({"items": [project]}),
+        json_response({"job": job, "run": run}),
+        json_response({"items": [project]}),
+        json_response(paused),
+        json_response({"items": [project]}),
+        json_response(job),
+        json_response({"items": [project]}),
+        json_response(cancelled),
+    ]
+    runner = CliRunner()
+
+    created = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "jobs",
+            "create",
+            "--project",
+            "dayplan",
+            "--target-app-user-id",
+            "app-user-123",
+            "--target-channel",
+            "api",
+            "--name",
+            "Daily review",
+            "--prompt",
+            "Review this account.",
+            "--interval-seconds",
+            "3600",
+            "--json",
+        ],
+    )
+    listed = runner.invoke(
+        app,
+        ["--config", str(config_path), "jobs", "list", "--project", "dayplan", "--json"],
+    )
+    detail = runner.invoke(
+        app,
+        ["--config", str(config_path), "jobs", "detail", "job/1", "--project", "dayplan"],
+    )
+    runs = runner.invoke(
+        app,
+        ["--config", str(config_path), "jobs", "runs", "job/1", "--project", "dayplan", "--json"],
+    )
+    dispatched = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "jobs",
+            "run",
+            "job/1",
+            "--project",
+            "dayplan",
+            "--dispatch-key",
+            "operator-smoke-1",
+            "--record-only",
+            "--json",
+        ],
+    )
+    paused_result = runner.invoke(
+        app,
+        ["--config", str(config_path), "jobs", "pause", "job/1", "--project", "dayplan", "--json"],
+    )
+    resumed_result = runner.invoke(
+        app,
+        ["--config", str(config_path), "jobs", "resume", "job/1", "--project", "dayplan"],
+    )
+    deleted = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "jobs",
+            "delete",
+            "job/1",
+            "--project",
+            "dayplan",
+            "--yes",
+            "--json",
+        ],
+    )
+
+    assert created.exit_code == 0
+    assert listed.exit_code == 0
+    assert detail.exit_code == 0
+    assert runs.exit_code == 0
+    assert dispatched.exit_code == 0
+    assert paused_result.exit_code == 0
+    assert resumed_result.exit_code == 0
+    assert deleted.exit_code == 0
+    assert json.loads(created.output)["id"] == "job/1"
+    assert json.loads(listed.output)["items"][0]["latest_trace_id"] == "trace-1"
+    assert "Daily review" in detail.output
+    assert json.loads(runs.output)["items"][0]["trace_id"] == "trace-1"
+    assert json.loads(dispatched.output)["run"]["dispatch_key"] == "scheduled:job/1:window"
+    assert json.loads(paused_result.output)["status"] == "paused"
+    assert "Scheduled job job/1 resumed" in resumed_result.output
+    assert json.loads(deleted.output)["terminal_reason"] == "cancelled"
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/scheduled-jobs"
+    )
+    assert FakeHTTPClient.requests[1]["json"]["schedule"] == {
+        "type": "interval",
+        "every_seconds": 3600,
+    }
+    assert FakeHTTPClient.requests[3]["params"] == {"limit": 50}
+    assert FakeHTTPClient.requests[5]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/scheduled-jobs/job%2F1"
+    )
+    assert FakeHTTPClient.requests[7]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/scheduled-jobs/job%2F1/runs"
+    )
+    assert FakeHTTPClient.requests[9]["json"] == {
+        "dispatch_key": "operator-smoke-1",
+        "execute": False,
+    }
+    assert FakeHTTPClient.requests[15]["method"] == "DELETE"
 
 
 def test_channels_status_connect_test_and_disconnect(tmp_path: Path) -> None:
@@ -2652,7 +3581,7 @@ def test_channels_rejects_blank_sender_value(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "--phone-number-id is required for this channel" in result.output
+    assert "--phone-number-id is required for this channel" in plain_cli_output(result)
     assert len(FakeHTTPClient.requests) == 1
     assert FakeHTTPClient.requests[0]["method"] == "GET"
 
@@ -2800,6 +3729,74 @@ def test_smoke_json_includes_readiness_and_trace_ids(tmp_path: Path) -> None:
         "model": None,
         "cost_usd": 0.004,
         "ready_status": "ok",
+    }
+
+
+def test_smoke_writes_launch_evidence_with_support_bundle(tmp_path: Path) -> None:
+    """Smoke evidence should link response proof, support bundle, and dashboard trace URLs."""
+    config_path = write_config(tmp_path)
+    evidence_path = tmp_path / "smoke-evidence.json"
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    support_bundle = {
+        "api_version": "genaug.observability_support_bundle.v1",
+        "project_id": "proj/1",
+        "metrics": {"trace_count": 1, "audit_event_count": 1, "usage_event_count": 1},
+        "traces": [{"trace_id": "trace_1", "response_id": "resp_smoke"}],
+        "audit_events": [{"event_type": "responses.create"}],
+        "usage_events": [{"event_type": "agent_turn"}],
+    }
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "id": "resp_smoke",
+                "status": "completed",
+                "model": "mock/balanced",
+                "output_text": "ok",
+                "metadata": {
+                    "general_augment_request_id": "req_1",
+                    "general_augment_trace_id": "trace_1",
+                },
+            }
+        ),
+        json_response(support_bundle),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "smoke",
+            "--project",
+            "dayplan",
+            "--include-support-bundle",
+            "--evidence-output",
+            str(evidence_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["evidence"]["schema_version"] == "general-augment-smoke-evidence/v1"
+    assert evidence["support_receipt"]["trace_id"] == "trace_1"
+    assert evidence["support_receipt"]["response_id"] == "resp_smoke"
+    assert evidence["support_bundle"] == support_bundle
+    assert "trace_id=trace_1" in evidence["dashboard_urls"]["observability_url"]
+    assert "response_id=resp_smoke" in evidence["dashboard_urls"]["observability_url"]
+    assert evidence["dashboard_urls"]["project_url"].endswith("/projects/dayplan")
+    assert evidence["security"]["raw_secrets_included"] is False
+    assert FakeHTTPClient.requests[3]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/observability/support-bundle"
+    )
+    assert FakeHTTPClient.requests[3]["params"] == {
+        "limit": 25,
+        "user_id": "genaug-smoke",
+        "trace_id": "trace_1",
+        "response_id": "resp_smoke",
     }
 
 
@@ -3101,22 +4098,30 @@ def test_verify_exercises_responses_when_cli_key_is_project_scoped(tmp_path: Pat
         "channel_status_known",
         "billing_state_known",
     }
-    assert next(
-        item for item in readiness["items"] if item["key"] == "project_key_execution"
-    )["status"] == "PASS"
-    assert next(
-        item for item in readiness["items"] if item["key"] == "runtime_policy_visible"
-    )["status"] == "PASS"
+    assert (
+        next(item for item in readiness["items"] if item["key"] == "project_key_execution")[
+            "status"
+        ]
+        == "PASS"
+    )
+    assert (
+        next(item for item in readiness["items"] if item["key"] == "runtime_policy_visible")[
+            "status"
+        ]
+        == "PASS"
+    )
     routing_check = next(
         item for item in payload["checks"] if item["name"] == "runtime_policy_model_routing"
     )
     assert routing_check["status"] == "PASS"
-    assert next(item for item in payload["checks"] if item["name"] == "soul_visible")[
-        "status"
-    ] == "PASS"
-    assert next(item for item in payload["checks"] if item["name"] == "skills_visible")[
-        "status"
-    ] == "PASS"
+    assert (
+        next(item for item in payload["checks"] if item["name"] == "soul_visible")["status"]
+        == "PASS"
+    )
+    assert (
+        next(item for item in payload["checks"] if item["name"] == "skills_visible")["status"]
+        == "PASS"
+    )
     assert payload["runtime_policy"]["model_routing"]["channel_parity"] is True
     assert payload["runtime_policy"]["model_routing"]["tiers"] == {
         "simple": "google/gemini-2.5-flash-lite",
@@ -3159,7 +4164,7 @@ def test_onboarding_verify_json_wraps_project_acceptance(tmp_path: Path) -> None
     assert result.exit_code == 0
     assert "secret" not in result.output
     payload = json.loads(result.output)
-    assert payload["cli"]["version"] == "0.1.0"
+    assert payload["cli"]["version"] == "0.1.1"
     assert payload["api"] == {"build_sha": "abc123", "status": "ok", "version": "0.1.0"}
     assert payload["readiness_checklist"]["version"] == "general-augment-readiness/v1"
     assert payload["onboarding"]["verdict"] == "PASS"
