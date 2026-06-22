@@ -24,6 +24,10 @@ const ADMIN_PREFIX = "/api/v1/admin";
 const INTEGRATIONS_PREFIX = "/api/v1/integrations";
 const DEFAULT_BASE_URL = "https://api.generalaugment.com";
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_MAX_RETRIES = 2;
+const RETRY_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+const INITIAL_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 8_000;
 
 export class GeneralAugmentAPIError extends Error {
   statusCode: number;
@@ -64,12 +68,14 @@ export class GeneralAugmentClient {
   private baseUrl: string;
   private fetchImpl: typeof fetch;
   private timeoutMs: number | undefined;
+  private maxRetries: number;
 
   constructor(options: GeneralAugmentClientOptions) {
     this.apiKey = options.apiKey;
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = normalizeTimeoutMs(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.maxRetries = normalizeMaxRetries(options.maxRetries ?? DEFAULT_MAX_RETRIES);
   }
 
   async adminRequest<T>(
@@ -94,7 +100,7 @@ export class GeneralAugmentClient {
   ): Promise<ResponseObject> {
     return this.request<ResponseObject>("POST", "/v1/responses", {
       json: payload,
-      headers: responseHeaders(options),
+      headers: responseHeaders(options, { autoIdempotency: true }),
       auth: "bearer"
     });
   }
@@ -103,15 +109,43 @@ export class GeneralAugmentClient {
     payload: ResponseCreateRequest,
     options: ResponseRequestOptions = {}
   ): AsyncIterable<ResponseStreamEvent> {
-    const response = await this.fetchRequest("POST", "/v1/responses", {
-      json: { ...payload, stream: true },
-      headers: responseHeaders(options),
-      auth: "bearer"
-    });
+    const timeout = requestTimeout(this.timeoutMs);
+    let response: Response;
+    try {
+      response = await this.sendFetch(
+        "POST",
+        "/v1/responses",
+        {
+          json: { ...payload, stream: true },
+          headers: responseHeaders(options, { autoIdempotency: true }),
+          auth: "bearer"
+        },
+        timeout.signal
+      );
+      if (!response.ok) {
+        const errorInfo = await responseErrorInfo(response);
+        throw new GeneralAugmentAPIError(response.status, errorInfo.detail, {
+          error: errorInfo.error,
+          requestId: errorInfo.requestId,
+          rateLimit: errorInfo.rateLimit
+        });
+      }
+    } catch (error) {
+      timeout.cancel();
+      throw requestFailureError(error);
+    }
     if (!response.body) {
+      timeout.cancel();
       return;
     }
-    yield* parseSSE(response.body);
+    // The timeout signal (and its abort timer) is intentionally NOT cancelled
+    // here: it must cover the whole streamed body, not just response headers.
+    // parseSSE cancels the timer once iteration finishes or aborts.
+    try {
+      yield* parseSSE(response.body, timeout);
+    } catch (error) {
+      throw requestFailureError(error);
+    }
   }
 
   async storeMemory(payload: StoreMemoryRequest): Promise<MemoryStoreResponse> {
@@ -286,49 +320,45 @@ export class GeneralAugmentClient {
     path: string,
     options: RequestOptions = {}
   ): Promise<T> {
-    const timeout = requestTimeout(this.timeoutMs);
-    try {
-      const response = await this.sendFetch(method, path, options, timeout.signal);
-      if (!response.ok) {
-        const errorInfo = await responseErrorInfo(response);
-        throw new GeneralAugmentAPIError(response.status, errorInfo.detail, {
-          error: errorInfo.error,
-          requestId: errorInfo.requestId,
-          rateLimit: errorInfo.rateLimit
-        });
+    let attempt = 0;
+    // Transient failures (HTTP 429/5xx and connection/timeout errors) are
+    // retried with exponential backoff + jitter, honoring Retry-After. Retries
+    // are safe: the only non-idempotent endpoint (createResponse) always sends
+    // an idempotency key.
+    for (;;) {
+      const timeout = requestTimeout(this.timeoutMs);
+      try {
+        const response = await this.sendFetch(method, path, options, timeout.signal);
+        if (!response.ok) {
+          if (RETRY_STATUS_CODES.has(response.status) && attempt < this.maxRetries) {
+            const retryAfter = response.headers.get("Retry-After");
+            // Drain the body so the connection can be reused before retrying.
+            await response.text().catch(() => undefined);
+            await sleep(retryDelayMs(attempt, retryAfter));
+            attempt += 1;
+            continue;
+          }
+          const errorInfo = await responseErrorInfo(response);
+          throw new GeneralAugmentAPIError(response.status, errorInfo.detail, {
+            error: errorInfo.error,
+            requestId: errorInfo.requestId,
+            rateLimit: errorInfo.rateLimit
+          });
+        }
+        if (response.status === 204) {
+          return undefined as T;
+        }
+        return await successJson<T>(response);
+      } catch (error) {
+        if (isRetriableTransportError(error, timeout.signal) && attempt < this.maxRetries) {
+          await sleep(retryDelayMs(attempt, null));
+          attempt += 1;
+          continue;
+        }
+        throw requestFailureError(error);
+      } finally {
+        timeout.cancel();
       }
-      if (response.status === 204) {
-        return undefined as T;
-      }
-      return await successJson<T>(response);
-    } catch (error) {
-      throw requestFailureError(error);
-    } finally {
-      timeout.cancel();
-    }
-  }
-
-  private async fetchRequest(
-    method: string,
-    path: string,
-    options: RequestOptions = {}
-  ): Promise<Response> {
-    const timeout = requestTimeout(this.timeoutMs);
-    try {
-      const response = await this.sendFetch(method, path, options, timeout.signal);
-      if (!response.ok) {
-        const errorInfo = await responseErrorInfo(response);
-        throw new GeneralAugmentAPIError(response.status, errorInfo.detail, {
-          error: errorInfo.error,
-          requestId: errorInfo.requestId,
-          rateLimit: errorInfo.rateLimit
-        });
-      }
-      return response;
-    } catch (error) {
-      throw requestFailureError(error);
-    } finally {
-      timeout.cancel();
     }
   }
 
@@ -409,6 +439,59 @@ type RequestTimeout = {
   cancel: () => void;
 };
 
+function normalizeMaxRetries(value: number): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new TypeError("General Augment maxRetries must be a non-negative integer.");
+  }
+  return value;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelayMs(attempt: number, retryAfter: string | null): number {
+  const parsed = parseRetryAfter(retryAfter);
+  if (parsed !== undefined) {
+    return Math.min(parsed, MAX_BACKOFF_MS);
+  }
+  const base = Math.min(INITIAL_BACKOFF_MS * 2 ** attempt, MAX_BACKOFF_MS);
+  return base / 2 + Math.random() * (base / 2);
+}
+
+// Parse a Retry-After header in delta-seconds OR HTTP-date form. The HTTP-date
+// form previously produced NaN (Number(date) === NaN); this handles both.
+function parseRetryAfter(value: string | null): number | undefined {
+  if (value === null) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return undefined;
+  }
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    return Math.max(Number(trimmed) * 1000, 0);
+  }
+  const when = Date.parse(trimmed);
+  if (Number.isNaN(when)) {
+    return undefined;
+  }
+  return Math.max(when - Date.now(), 0);
+}
+
+function isRetriableTransportError(error: unknown, signal: AbortSignal | undefined): boolean {
+  if (error instanceof GeneralAugmentAPIError) {
+    return false;
+  }
+  // A deliberate client timeout aborts via `signal`; treat that as retriable
+  // (a transient stall), but only if it was our timeout that fired.
+  if (isAbortError(error)) {
+    return signal?.aborted === true;
+  }
+  // fetch network failures surface as TypeError.
+  return error instanceof TypeError;
+}
+
 function normalizeTimeoutMs(value: number | undefined): number | undefined {
   if (value === undefined || value === 0) {
     return undefined;
@@ -454,10 +537,21 @@ function isAbortError(error: unknown): boolean {
   );
 }
 
-function responseHeaders(options: ResponseRequestOptions): Record<string, string> {
+function generateIdempotencyKey(): string {
+  return crypto.randomUUID();
+}
+
+function responseHeaders(
+  options: ResponseRequestOptions,
+  config: { autoIdempotency?: boolean } = {}
+): Record<string, string> {
   const headers: Record<string, string> = {};
-  if (options.idempotencyKey) {
-    headers["X-Idempotency-Key"] = options.idempotencyKey;
+  // Auto-generate an idempotency key for billable turns so retries are safe.
+  // A caller-supplied key always wins.
+  const idempotencyKey =
+    options.idempotencyKey ?? (config.autoIdempotency ? generateIdempotencyKey() : undefined);
+  if (idempotencyKey) {
+    headers["X-Idempotency-Key"] = idempotencyKey;
   }
   if (options.requestId) {
     headers["X-Request-ID"] = options.requestId;
@@ -633,31 +727,72 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncIterable<ResponseStreamEvent> {
+async function* parseSSE(
+  body: ReadableStream<Uint8Array>,
+  timeout: RequestTimeout
+): AsyncIterable<ResponseStreamEvent> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    let boundary = sseBoundary(buffer);
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + sseSeparatorLength(buffer, boundary));
-      const event = parseSSEBlock(block);
-      if (event) {
-        yield event;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      let boundary = sseBoundary(buffer);
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + sseSeparatorLength(buffer, boundary));
+        const event = parseSSEBlock(block);
+        if (event) {
+          if (isSSEDone(event)) {
+            return;
+          }
+          raiseForSSEError(event);
+          yield event;
+        }
+        boundary = sseBoundary(buffer);
       }
-      boundary = sseBoundary(buffer);
-    }
-    if (done) {
-      const event = parseSSEBlock(buffer);
-      if (event) {
-        yield event;
+      if (done) {
+        const event = parseSSEBlock(buffer);
+        if (event && !isSSEDone(event)) {
+          raiseForSSEError(event);
+          yield event;
+        }
+        return;
       }
-      return;
     }
+  } finally {
+    // Always release the lock and cancel the stream on early break/throw/return
+    // so the connection is not leaked.
+    timeout.cancel();
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore: stream may already be errored/closed.
+    }
+    reader.releaseLock();
   }
+}
+
+function isSSEDone(event: ResponseStreamEvent): boolean {
+  return typeof event.data === "string" && event.data.trim() === "[DONE]";
+}
+
+function raiseForSSEError(event: ResponseStreamEvent): void {
+  if (event.event !== "error") {
+    return;
+  }
+  const data = event.data;
+  const error = isJsonObject(data) ? (data as APIErrorDetail) : undefined;
+  const detail =
+    typeof data === "string"
+      ? data
+      : error
+        ? JSON.stringify(error)
+        : "Stream returned an error event.";
+  throw new GeneralAugmentAPIError(0, detail, {
+    error: error ?? { reason: "stream_error", message: detail }
+  });
 }
 
 function sseBoundary(buffer: string): number {

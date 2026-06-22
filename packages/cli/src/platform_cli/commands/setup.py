@@ -91,7 +91,13 @@ def setup(
         project_payload = bootstrap_payload.get("project")
         if isinstance(project_payload, dict):
             selected_project = str(project_payload.get("id") or selected_project or "")
-            setup_config = runtime.config.model_copy(update={"active_project": selected_project})
+            config_update: dict[str, object] = {"active_project": selected_project}
+            # Persist the minted runtime key so smoke/verify/doctor authenticate
+            # without a manual `export`. The config file is chmod 600 and the raw
+            # key is never written to artifacts or echoed unless --print-env asks.
+            if runtime_env and runtime_env.get("GENAUG_API_KEY"):
+                config_update["api_key"] = runtime_env["GENAUG_API_KEY"]
+            setup_config = runtime.config.model_copy(update=config_update)
             save_config(setup_config, runtime.config_path)
     payload = build_setup_payload(
         workspace=workspace,

@@ -11,7 +11,11 @@ from platform_cli.client import encode_path_segment, resolve_project
 from platform_cli.errors import CLIError
 from platform_cli.output import print_json, print_success, table
 from platform_cli.runtime import Runtime
-from platform_cli.self_serve import installer_auth_metadata, skill_design_recipe
+from platform_cli.self_serve import (
+    installer_auth_metadata,
+    resolve_installer_project_id,
+    skill_design_recipe,
+)
 
 app = typer.Typer(help="Manage tenant skills.")
 
@@ -198,7 +202,9 @@ def _push_starter_skill_bundle(
     with runtime.client() as client:
         if installer is not None:
             token = str(installer["access_token"])
-            project_id = str(project_ref)
+            project_id = resolve_installer_project_id(
+                client, token=token, project_ref=str(project_ref)
+            )
             skill = client.installer(
                 "POST",
                 f"/projects/{encode_path_segment(project_id)}/skills",

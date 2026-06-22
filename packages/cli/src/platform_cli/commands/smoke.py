@@ -19,6 +19,8 @@ from platform_cli.self_serve import DEFAULT_DASHBOARD_URL, dashboard_project_url
 
 DEFAULT_SMOKE_MESSAGE = "Reply exactly with: genaug-smoke-ok"
 DEFAULT_STRUCTURED_MESSAGE = 'Return JSON with ok=true and label="genaug-smoke-ok".'
+EXPECTED_SMOKE_TOKEN = "genaug-smoke-ok"
+_COMPLETED_STATUSES = {"completed", "complete", ""}
 DEFAULT_STRUCTURED_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -96,6 +98,12 @@ def smoke(
     turn_id = uuid.uuid4().hex[:12]
     schema = _load_schema(schema_file) if schema_file else None
     structured = structured or schema is not None
+    # We can only assert the exact echoed token for the built-in prompts and the
+    # built-in schema. A custom --message or --schema-file means we only require a
+    # well-formed, non-empty response (or valid JSON for structured output).
+    expects_default_token = (
+        message in {DEFAULT_SMOKE_MESSAGE, DEFAULT_STRUCTURED_MESSAGE} and schema is None
+    )
     if structured and message == DEFAULT_SMOKE_MESSAGE:
         message = DEFAULT_STRUCTURED_MESSAGE
     headers = _correlation_headers(
@@ -157,11 +165,19 @@ def smoke(
         dashboard_urls=dashboard_urls,
         support_bundle=support_bundle,
     )
+    verdict = _smoke_verdict(
+        ready=ready,
+        response=response,
+        structured=structured,
+        expects_default_token=expects_default_token,
+    )
     if evidence_output is not None:
         _write_evidence(evidence_output, smoke_evidence)
     if raw:
         print_json(
             {
+                "verdict": verdict["verdict"],
+                "verdict_detail": verdict["detail"],
                 "ready": ready,
                 "response": response,
                 "response_id": response.get("id") if isinstance(response, dict) else None,
@@ -180,6 +196,8 @@ def smoke(
                 "evidence": smoke_evidence,
             }
         )
+        if verdict["verdict"] != "PASS":
+            raise CLIError(verdict["detail"])
         return
 
     rows: list[list[object]] = [["Ready", _status_text(ready)]]
@@ -211,12 +229,16 @@ def smoke(
             rows.append(["Dashboard", dashboard_urls["observability_url"]])
         if evidence_output is not None:
             rows.append(["Evidence", evidence_output])
+    rows.append(["Verdict", verdict["verdict"]])
     table("Smoke", ["Check", "Value"], rows)
     if isinstance(response, dict):
         panel("Output", _response_output_text(response) or "<empty>")
         panel("Support receipt", json.dumps(support_receipt, indent=2, sort_keys=True))
     if evidence_output is not None:
         print_success(f"Wrote smoke evidence to {evidence_output}.")
+    if verdict["verdict"] != "PASS":
+        raise CLIError(verdict["detail"])
+    print_success("Smoke passed: the agent returned the expected response.")
 
 
 def _correlation_headers(
@@ -289,6 +311,75 @@ def _status_text(payload: object) -> str:
     if isinstance(payload, dict):
         return str(payload.get("status") or payload)
     return str(payload)
+
+
+def _smoke_verdict(
+    *,
+    ready: object,
+    response: object,
+    structured: bool,
+    expects_default_token: bool,
+) -> dict[str, str]:
+    """Decide PASS/FAIL from the actual response body, not just an HTTP 200.
+
+    An agent gates on the exit code, so a 200 with an empty or wrong body must
+    fail. The detail string doubles as the error message + next step on failure.
+    """
+    next_step = "Check the project model routing and provider setup, then rerun genaug smoke."
+    if not _health_ok(ready):
+        return _verdict_fail(f"Platform health check was not ready. {next_step}")
+    if not isinstance(response, dict):
+        return _verdict_fail(f"Responses call did not return a JSON object. {next_step}")
+    if not str(response.get("id") or ""):
+        return _verdict_fail(f"Response is missing an id; the turn did not complete. {next_step}")
+    status = str(response.get("status") or "")
+    if status not in _COMPLETED_STATUSES:
+        return _verdict_fail(f"Response status was {status!r}, not completed. {next_step}")
+    output_text = _response_output_text(response)
+    if not output_text.strip():
+        return _verdict_fail(f"Agent returned an empty response body. {next_step}")
+    if structured:
+        return _structured_verdict(output_text, expects_default_token, next_step)
+    if expects_default_token and EXPECTED_SMOKE_TOKEN not in output_text:
+        return _verdict_fail(
+            f"Agent did not echo the expected smoke token {EXPECTED_SMOKE_TOKEN!r}; "
+            f"got {output_text.strip()[:80]!r}. {next_step}"
+        )
+    return {"verdict": "PASS", "detail": "Agent returned a well-formed smoke response."}
+
+
+def _structured_verdict(
+    output_text: str,
+    expects_default_token: bool,
+    next_step: str,
+) -> dict[str, str]:
+    """Validate structured-output smoke responses parse and carry the expected fields."""
+    try:
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError:
+        return _verdict_fail(f"Structured smoke output was not valid JSON. {next_step}")
+    if not isinstance(parsed, dict):
+        return _verdict_fail(f"Structured smoke output was not a JSON object. {next_step}")
+    if expects_default_token:
+        if not parsed.get("ok"):
+            return _verdict_fail(f"Structured smoke output did not set ok=true. {next_step}")
+        if str(parsed.get("label") or "") != EXPECTED_SMOKE_TOKEN:
+            return _verdict_fail(
+                f"Structured smoke output label was not {EXPECTED_SMOKE_TOKEN!r}. {next_step}"
+            )
+    return {"verdict": "PASS", "detail": "Agent returned valid structured smoke output."}
+
+
+def _verdict_fail(detail: str) -> dict[str, str]:
+    """Build a failing smoke verdict row."""
+    return {"verdict": "FAIL", "detail": detail}
+
+
+def _health_ok(payload: object) -> bool:
+    """Return whether a health payload reports a ready/ok status."""
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("status") or "").lower() in {"ok", "ready", "healthy", "pass"}
 
 
 def _response_output_text(response: dict[str, Any]) -> str:

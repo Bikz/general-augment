@@ -1,4 +1,8 @@
-export const VERSION = "0.1.0";
+// Single source of truth: the version is imported from package.json so the
+// published VERSION constant can never drift from the package manifest.
+import pkg from "../package.json" with { type: "json" };
+
+export const VERSION: string = (pkg as { version: string }).version;
 
 export { AgentClient, testAgent } from "./agent.js";
 export {

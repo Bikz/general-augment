@@ -14,7 +14,12 @@ Markdown export.
 from __future__ import annotations
 
 import json as json_module
+import random
+import time
+import uuid
 from collections.abc import Iterator, Mapping
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -26,6 +31,11 @@ BEARER_AUTH_HEADER = "Authorization"
 ADMIN_PREFIX = "/api/v1/admin"
 INTEGRATIONS_PREFIX = "/api/v1/integrations"
 DEFAULT_BASE_URL = "https://api.generalaugment.com"
+
+DEFAULT_MAX_RETRIES = 2
+RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_INITIAL_BACKOFF_SECONDS = 0.5
+_MAX_BACKOFF_SECONDS = 8.0
 
 
 class GeneralAugmentAPIError(RuntimeError):
@@ -64,6 +74,8 @@ class GeneralAugmentClient:
         api_key: Admin API key. Project-scoped keys are supported.
         base_url: General Augment API base URL.
         timeout: Request timeout in seconds.
+        max_retries: Number of automatic retries for transient failures
+            (HTTP 429/5xx and connection/timeout errors). Set to 0 to disable.
         client: Optional injected `httpx.Client`, useful for tests.
     """
 
@@ -73,14 +85,25 @@ class GeneralAugmentClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 30.0,
+        max_retries: int = DEFAULT_MAX_RETRIES,
         client: httpx.Client | None = None,
     ) -> None:
         """Initialize the General Augment API client."""
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0.")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.max_retries = max_retries
         self._client = client or httpx.Client(timeout=timeout)
         self._owns_client = client is None
+
+    def __del__(self) -> None:
+        """Best-effort close for callers that skip the context manager."""
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - defensive cleanup
+            pass
 
     def close(self) -> None:
         """Close the underlying HTTP client if the SDK created it."""
@@ -148,14 +171,19 @@ class GeneralAugmentClient:
         traceparent: str | None = None,
         tracestate: str | None = None,
     ) -> dict[str, Any]:
-        """Create one Responses-compatible General Augment turn."""
+        """Create one Responses-compatible General Augment turn.
+
+        When no idempotency key is supplied, one is auto-generated so that
+        automatic retries of this billable turn cannot double-execute. A
+        caller-supplied key always wins.
+        """
         return _as_dict(
             self._request(
                 "POST",
                 "/v1/responses",
                 json=payload,
                 headers=_response_headers(
-                    idempotency_key=idempotency_key,
+                    idempotency_key=idempotency_key or _generate_idempotency_key(),
                     request_id=request_id,
                     traceparent=traceparent,
                     tracestate=tracestate,
@@ -173,16 +201,24 @@ class GeneralAugmentClient:
         traceparent: str | None = None,
         tracestate: str | None = None,
     ) -> Iterator[dict[str, Any]]:
-        """Stream semantic Responses SSE events."""
+        """Stream semantic Responses SSE events.
+
+        The whole stream (not just the initial response headers) is bounded by
+        the client timeout; a mid-body stall raises a timeout error. The
+        underlying response is always closed, including on early iterator exit.
+        A `[DONE]` sentinel ends the stream cleanly, and a mid-stream
+        `event: error` frame raises a :class:`GeneralAugmentAPIError`.
+        """
         body = dict(payload)
         body["stream"] = True
+        deadline = None if self.timeout is None else time.monotonic() + self.timeout
         try:
             with self._client.stream(
                 "POST",
                 f"{self.base_url}/v1/responses",
                 headers=self._headers(
                     _response_headers(
-                        idempotency_key=idempotency_key,
+                        idempotency_key=idempotency_key or _generate_idempotency_key(),
                         request_id=request_id,
                         traceparent=traceparent,
                         tracestate=tracestate,
@@ -194,7 +230,13 @@ class GeneralAugmentClient:
                 if response.is_error:
                     response.read()
                     raise _api_error_from_response(response)
-                yield from _iter_sse_events(response.iter_lines())
+                for event in _iter_sse_events(response.iter_lines()):
+                    if deadline is not None and time.monotonic() > deadline:
+                        raise httpx.ReadTimeout("Stream exceeded the client timeout.")
+                    if _is_sse_done(event):
+                        return
+                    _raise_for_sse_error(event)
+                    yield event
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
             raise _api_error_from_transport(exc) from exc
 
@@ -281,8 +323,12 @@ class GeneralAugmentClient:
         return self.create_project_from_config(content)
 
     def update_project(self, project_id: str, **fields: Any) -> dict[str, Any]:
-        """Patch mutable project fields."""
-        payload = {key: value for key, value in fields.items() if value is not None}
+        """Patch mutable project fields.
+
+        Pass ``UNSET`` (the module-level sentinel) to omit a field from the
+        request; an explicit ``None`` is sent so a field can be PATCHed to null.
+        """
+        payload = {key: value for key, value in fields.items() if value is not UNSET}
         return _as_dict(
             self.admin_request("PATCH", f"/projects/{_path_segment(project_id)}", json=payload)
         )
@@ -404,22 +450,41 @@ class GeneralAugmentClient:
         headers: Mapping[str, str] | None = None,
         auth: str = "admin",
     ) -> Any:
-        """Execute a raw request against the General Augment API."""
-        try:
-            response = self._client.request(
-                method,
-                f"{self.base_url}{path}",
-                headers=self._headers(headers, auth=auth),
-                json=json,
-                params=params,
-            )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
-            raise _api_error_from_transport(exc) from exc
-        if response.is_error:
-            raise _api_error_from_response(response)
-        if response.status_code == 204:
-            return None
-        return _success_body(response)
+        """Execute a raw request against the General Augment API with retries.
+
+        Transient failures (HTTP 429/5xx and connection/timeout errors) are
+        retried up to ``max_retries`` times with exponential backoff and jitter,
+        honoring a ``Retry-After`` header when present. Retries are safe because
+        the only non-idempotent endpoint (``create_response``) always sends an
+        idempotency key.
+        """
+        request_headers = self._headers(headers, auth=auth)
+        url = f"{self.base_url}{path}"
+        attempt = 0
+        while True:
+            try:
+                response = self._client.request(
+                    method,
+                    url,
+                    headers=request_headers,
+                    json=json,
+                    params=params,
+                )
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
+                if attempt < self.max_retries:
+                    _sleep_backoff(attempt, None)
+                    attempt += 1
+                    continue
+                raise _api_error_from_transport(exc) from exc
+            if response.is_error:
+                if response.status_code in RETRY_STATUS_CODES and attempt < self.max_retries:
+                    _sleep_backoff(attempt, response.headers.get("Retry-After"))
+                    attempt += 1
+                    continue
+                raise _api_error_from_response(response)
+            if response.status_code == 204:
+                return None
+            return _success_body(response)
 
     def _headers(self, extra: Mapping[str, str] | None = None, *, auth: str) -> dict[str, str]:
         """Build request headers for admin or project-key app calls."""
@@ -433,6 +498,7 @@ class GeneralAugmentClient:
 
 
 __all__ = [
+    "UNSET",
     "GeneralAugmentAPIError",
     "GeneralAugmentClient",
     "response_output_text",
@@ -690,6 +756,90 @@ def _response_headers(
     if tracestate:
         headers["tracestate"] = tracestate
     return headers
+
+
+class _Unset:
+    """Sentinel type so ``update_project`` can distinguish omitted from null."""
+
+    _instance: _Unset | None = None
+
+    def __new__(cls) -> _Unset:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "UNSET"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+UNSET = _Unset()
+
+
+def _generate_idempotency_key() -> str:
+    """Return a fresh idempotency key for a billable, retry-safe turn."""
+    return str(uuid.uuid4())
+
+
+def _sleep_backoff(attempt: int, retry_after: str | None) -> None:
+    """Sleep before a retry using Retry-After when present, else jittered backoff."""
+    time.sleep(_retry_delay_seconds(attempt, retry_after))
+
+
+def _retry_delay_seconds(attempt: int, retry_after: str | None) -> float:
+    """Compute the retry delay, honoring a Retry-After header when valid."""
+    parsed = _parse_retry_after(retry_after)
+    if parsed is not None:
+        return min(parsed, _MAX_BACKOFF_SECONDS)
+    base = min(_INITIAL_BACKOFF_SECONDS * (2**attempt), _MAX_BACKOFF_SECONDS)
+    return base / 2 + random.uniform(0, base / 2)
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header in delta-seconds or HTTP-date form."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return max(seconds, 0.0)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delta = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(delta, 0.0)
+
+
+def _is_sse_done(event: dict[str, Any]) -> bool:
+    """Return True for the ``[DONE]`` stream sentinel."""
+    data = event.get("data")
+    return isinstance(data, str) and data.strip() == "[DONE]"
+
+
+def _raise_for_sse_error(event: dict[str, Any]) -> None:
+    """Raise an API error for a mid-stream ``event: error`` frame."""
+    if event.get("event") != "error":
+        return
+    body = event.get("data")
+    detail = _error_detail(body, "Stream returned an error event.")
+    raise GeneralAugmentAPIError(
+        0,
+        detail,
+        code=_error_code(body),
+        reason=_error_reason(body) or "stream_error",
+        body=body,
+    )
 
 
 def _iter_sse_events(lines: Iterator[str]) -> Iterator[dict[str, Any]]:

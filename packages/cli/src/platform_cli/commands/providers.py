@@ -15,6 +15,7 @@ from platform_cli.self_serve import (
     installer_auth_metadata,
     normalize_capabilities,
     provider_setup_recipes,
+    resolve_installer_project_id,
 )
 
 app = typer.Typer(help="Plan capability provider setup.")
@@ -117,7 +118,9 @@ def _configure_provider(
     with runtime.client() as client:
         if installer is not None:
             token = str(installer["access_token"])
-            project_id = str(project_ref)
+            project_id = resolve_installer_project_id(
+                client, token=token, project_ref=str(project_ref)
+            )
             credential = client.installer(
                 "PUT",
                 (
