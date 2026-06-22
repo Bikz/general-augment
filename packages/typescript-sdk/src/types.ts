@@ -5,6 +5,11 @@ export interface GeneralAugmentClientOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /**
+   * Number of automatic retries for transient failures (HTTP 429/5xx and
+   * connection/timeout errors). Defaults to 2. Set to 0 to disable.
+   */
+  maxRetries?: number;
 }
 
 export interface APIErrorDetail {

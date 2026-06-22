@@ -13,11 +13,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from genaug import (
+    UNSET,
     GeneralAugmentAPIError,
     GeneralAugmentClient,
     response_output_text,
     response_structured_output,
 )
+from genaug import client as client_module
 
 
 def test_request_paths_encode_reserved_segments() -> None:
@@ -214,7 +216,9 @@ def test_api_error_exposes_reason_correlation_and_rate_limit_headers() -> None:
         )
 
     http_client = httpx.Client(transport=httpx.MockTransport(handler))
-    client = GeneralAugmentClient("secret", base_url="http://api.test", client=http_client)
+    client = GeneralAugmentClient(
+        "secret", base_url="http://api.test", max_retries=0, client=http_client
+    )
 
     with pytest.raises(GeneralAugmentAPIError) as exc_info:
         client.create_response({"model": "balanced", "input": "Hello"})
@@ -262,7 +266,9 @@ def test_transport_failure_raises_typed_api_error() -> None:
         raise httpx.ConnectError("network down")
 
     http_client = httpx.Client(transport=httpx.MockTransport(handler))
-    client = GeneralAugmentClient("secret", base_url="http://api.test", client=http_client)
+    client = GeneralAugmentClient(
+        "secret", base_url="http://api.test", max_retries=0, client=http_client
+    )
 
     with pytest.raises(GeneralAugmentAPIError) as exc_info:
         client.create_response({"model": "balanced", "input": "Hello"})
@@ -422,3 +428,188 @@ def test_mock_contract_flow_covers_responses_and_memory_fixtures() -> None:
         ("GET", "/api/v1/agent/memory/profile/sdk-contract-user"),
     ]
     assert calls[0][2]["authorization"] == "Bearer local-test"
+
+
+def test_create_response_retries_429_and_honors_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient 429s should be retried with backoff that honors Retry-After."""
+    slept: list[float] = []
+    monkeypatch.setattr(client_module.time, "sleep", lambda seconds: slept.append(seconds))
+
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers["x-idempotency-key"])
+        if len(attempts) == 1:
+            return httpx.Response(
+                429,
+                json={"detail": "slow down"},
+                headers={"Retry-After": "7"},
+            )
+        return httpx.Response(200, json={"id": "resp_ok"})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient(
+        "secret", base_url="http://api.test", max_retries=2, client=http_client
+    )
+
+    response = client.create_response({"model": "balanced", "input": "Hello"})
+
+    assert response["id"] == "resp_ok"
+    assert len(attempts) == 2
+    # Same auto-generated idempotency key reused across retries -> safe replay.
+    assert attempts[0] == attempts[1]
+    # Retry-After (7s) honored, capped at the max backoff (8s).
+    assert slept == [7.0]
+
+
+def test_request_retries_5xx_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """503s should be retried up to max_retries with jittered backoff."""
+    monkeypatch.setattr(client_module.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(503, json={"detail": "unavailable"})
+        return httpx.Response(200, json={"items": [{"id": "p1"}]})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient(
+        "secret", base_url="http://api.test", max_retries=3, client=http_client
+    )
+
+    assert client.list_projects() == [{"id": "p1"}]
+    assert calls["n"] == 3
+
+
+def test_retries_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """max_retries=0 should surface the first transient failure immediately."""
+    monkeypatch.setattr(client_module.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, json={"detail": "unavailable"})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient(
+        "secret", base_url="http://api.test", max_retries=0, client=http_client
+    )
+
+    with pytest.raises(GeneralAugmentAPIError) as exc_info:
+        client.list_projects()
+    assert exc_info.value.status_code == 503
+    assert calls["n"] == 1
+
+
+def test_connection_errors_are_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Connection failures should be retried before raising a typed error."""
+    monkeypatch.setattr(client_module.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise httpx.ConnectError("network down")
+        return httpx.Response(200, json={"items": []})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient(
+        "secret", base_url="http://api.test", max_retries=2, client=http_client
+    )
+
+    assert client.list_projects() == []
+    assert calls["n"] == 2
+
+
+def test_create_response_auto_generates_idempotency_key() -> None:
+    """create_response should auto-send X-Idempotency-Key when omitted."""
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["key"] = request.headers["x-idempotency-key"]
+        return httpx.Response(200, json={"id": "resp_1"})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient("secret", base_url="http://api.test", client=http_client)
+
+    client.create_response({"model": "balanced", "input": "Hello"})
+    assert seen["key"]  # non-empty UUID
+
+
+def test_create_response_preserves_caller_idempotency_key() -> None:
+    """A caller-supplied idempotency key must win over auto-generation."""
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["key"] = request.headers["x-idempotency-key"]
+        return httpx.Response(200, json={"id": "resp_1"})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient("secret", base_url="http://api.test", client=http_client)
+
+    client.create_response({"model": "balanced", "input": "Hello"}, idempotency_key="mine-1")
+    assert seen["key"] == "mine-1"
+
+
+def test_parse_retry_after_handles_http_date() -> None:
+    """Retry-After in HTTP-date form should parse to a non-negative delay."""
+    assert client_module._parse_retry_after("30") == 30.0
+    past = client_module._parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT")
+    assert past == 0.0  # date in the past clamps to 0
+    assert client_module._parse_retry_after("not-a-date") is None
+    assert client_module._parse_retry_after(None) is None
+
+
+def test_stream_stops_cleanly_on_done_sentinel() -> None:
+    """A [DONE] sentinel should end the stream without being yielded."""
+    sse_body = (
+        'event: response.created\ndata: {"type":"response.created"}\n\n'
+        "data: [DONE]\n\n"
+        'event: response.completed\ndata: {"type":"never"}\n\n'
+    )
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=sse_body, headers={"Content-Type": "text/event-stream"})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient("secret", base_url="http://api.test", client=http_client)
+
+    events = list(client.stream_response({"model": "balanced", "input": "Hello"}))
+    assert [event["event"] for event in events] == ["response.created"]
+
+
+def test_stream_mid_stream_error_frame_raises() -> None:
+    """A mid-stream `event: error` frame should raise a typed API error."""
+    sse_body = (
+        'event: response.created\ndata: {"type":"response.created"}\n\n'
+        'event: error\ndata: {"reason":"agent_failed","message":"boom"}\n\n'
+    )
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=sse_body, headers={"Content-Type": "text/event-stream"})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient("secret", base_url="http://api.test", client=http_client)
+
+    with pytest.raises(GeneralAugmentAPIError) as exc_info:
+        list(client.stream_response({"model": "balanced", "input": "Hello"}))
+    assert exc_info.value.reason == "agent_failed"
+    assert "boom" in exc_info.value.detail
+
+
+def test_update_project_omits_unset_but_sends_explicit_null() -> None:
+    """UNSET fields are dropped; explicit None is PATCHed as null."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "p1"})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = GeneralAugmentClient("secret", base_url="http://api.test", client=http_client)
+
+    client.update_project("p1", name="New", description=None, skipped=UNSET)
+    assert seen["json"] == {"name": "New", "description": None}

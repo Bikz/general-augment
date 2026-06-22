@@ -118,6 +118,7 @@ test("API errors expose structured reason codes and rate limit metadata", async 
   const client = new GeneralAugmentClient({
     apiKey: "gaadmlive_test",
     baseUrl: "https://api.example.test",
+    maxRetries: 0,
     fetchImpl: async () =>
       jsonResponse(
         {
@@ -192,6 +193,7 @@ test("fetch failures raise typed API error", async () => {
   const client = new GeneralAugmentClient({
     apiKey: "gaadmlive_test",
     baseUrl: "https://api.example.test",
+    maxRetries: 0,
     fetchImpl: async () => {
       throw new TypeError("network down");
     },
@@ -213,6 +215,7 @@ test("request timeouts abort stalled fetches with typed API error", async () => 
     apiKey: "gaadmlive_test",
     baseUrl: "https://api.example.test",
     timeoutMs: 1,
+    maxRetries: 0,
     fetchImpl: async (_url, init) =>
       new Promise((_resolve, reject) => {
         init.signal.addEventListener("abort", () => {
@@ -237,6 +240,7 @@ test("request timeouts cover stalled JSON response bodies", async () => {
     apiKey: "gaadmlive_test",
     baseUrl: "https://api.example.test",
     timeoutMs: 1,
+    maxRetries: 0,
     fetchImpl: async (_url, init) => ({
       ok: true,
       status: 200,
@@ -487,6 +491,244 @@ test("mock contract flow covers responses and memory fixtures", async () => {
     ],
   );
   assert.equal(calls[0].init.headers.Authorization, "Bearer local-test");
+});
+
+test("createResponse retries 429 and honors Retry-After, reusing idempotency key", async () => {
+  const keys = [];
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_test",
+    baseUrl: "https://api.example.test",
+    maxRetries: 2,
+    fetchImpl: async (_url, init) => {
+      keys.push(init.headers["X-Idempotency-Key"]);
+      if (keys.length === 1) {
+        return jsonResponse({ detail: "slow down" }, { status: 429, headers: { "Retry-After": "0" } });
+      }
+      return jsonResponse({ id: "resp_ok" });
+    },
+  });
+
+  const response = await client.createResponse({ input: "hi" });
+
+  assert.equal(response.id, "resp_ok");
+  assert.equal(keys.length, 2);
+  // Auto-generated key is reused across the retry so the turn cannot double-execute.
+  assert.ok(keys[0]);
+  assert.equal(keys[0], keys[1]);
+});
+
+test("request retries 503 then succeeds", async () => {
+  let calls = 0;
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_admin",
+    baseUrl: "https://api.example.test",
+    maxRetries: 3,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls < 3) {
+        return jsonResponse({ detail: "unavailable" }, { status: 503 });
+      }
+      return jsonResponse({ items: [{ id: "p1", name: "One", slug: "one", status: "active" }] });
+    },
+  });
+
+  const projects = await client.listProjects();
+  assert.equal(projects.length, 1);
+  assert.equal(calls, 3);
+});
+
+test("retries can be disabled with maxRetries=0", async () => {
+  let calls = 0;
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_admin",
+    baseUrl: "https://api.example.test",
+    maxRetries: 0,
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse({ detail: "unavailable" }, { status: 503 });
+    },
+  });
+
+  await assert.rejects(
+    () => client.listProjects(),
+    (error) => {
+      assert.equal(error.statusCode, 503);
+      return true;
+    },
+  );
+  assert.equal(calls, 1);
+});
+
+test("connection failures are retried before raising", async () => {
+  let calls = 0;
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_admin",
+    baseUrl: "https://api.example.test",
+    maxRetries: 2,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls < 2) {
+        throw new TypeError("network down");
+      }
+      return jsonResponse({ items: [] });
+    },
+  });
+
+  assert.deepEqual(await client.listProjects(), []);
+  assert.equal(calls, 2);
+});
+
+test("createResponse auto-generates an idempotency key when omitted", async () => {
+  let seenKey;
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_test",
+    baseUrl: "https://api.example.test",
+    fetchImpl: async (_url, init) => {
+      seenKey = init.headers["X-Idempotency-Key"];
+      return jsonResponse({ id: "resp_1" });
+    },
+  });
+
+  await client.createResponse({ input: "hi" });
+  assert.ok(seenKey && seenKey.length > 0);
+});
+
+test("createResponse preserves a caller-supplied idempotency key", async () => {
+  let seenKey;
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_test",
+    baseUrl: "https://api.example.test",
+    fetchImpl: async (_url, init) => {
+      seenKey = init.headers["X-Idempotency-Key"];
+      return jsonResponse({ id: "resp_1" });
+    },
+  });
+
+  await client.createResponse({ input: "hi" }, { idempotencyKey: "mine-1" });
+  assert.equal(seenKey, "mine-1");
+});
+
+test("Retry-After in HTTP-date form is parsed (not NaN), capped backoff applied", async () => {
+  const httpDate = new Date(Date.now() + 50).toUTCString();
+  let calls = 0;
+  const started = Date.now();
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_admin",
+    baseUrl: "https://api.example.test",
+    maxRetries: 1,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return jsonResponse({ detail: "slow" }, { status: 503, headers: { "Retry-After": httpDate } });
+      }
+      return jsonResponse({ items: [] });
+    },
+  });
+
+  await client.listProjects();
+  // If the HTTP-date had produced NaN, backoff would have fallen back to
+  // jittered exponential (>=250ms). The date is ~50ms out, so retry is prompt.
+  assert.equal(calls, 2);
+  assert.ok(Date.now() - started < 2000);
+});
+
+test("streamResponse stops cleanly on [DONE] sentinel", async () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('event: response.created\ndata: {"type":"response.created"}\n\n'));
+      controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+      controller.enqueue(new TextEncoder().encode('event: response.completed\ndata: {"type":"never"}\n\n'));
+      controller.close();
+    },
+  });
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_test",
+    baseUrl: "https://api.example.test",
+    fetchImpl: async () => new Response(stream, { status: 200 }),
+  });
+
+  const events = [];
+  for await (const event of client.streamResponse({ input: "hi" })) {
+    events.push(event);
+  }
+  assert.deepEqual(events.map((e) => e.event), ["response.created"]);
+});
+
+test("streamResponse raises on a mid-stream error frame", async () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('event: response.created\ndata: {"type":"response.created"}\n\n'));
+      controller.enqueue(new TextEncoder().encode('event: error\ndata: {"reason":"agent_failed","message":"boom"}\n\n'));
+      controller.close();
+    },
+  });
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_test",
+    baseUrl: "https://api.example.test",
+    fetchImpl: async () => new Response(stream, { status: 200 }),
+  });
+
+  const events = [];
+  await assert.rejects(
+    async () => {
+      for await (const event of client.streamResponse({ input: "hi" })) {
+        events.push(event);
+      }
+    },
+    (error) => {
+      assert.ok(error instanceof GeneralAugmentAPIError);
+      assert.equal(error.reason, "agent_failed");
+      assert.ok(error.detail.includes("boom"));
+      return true;
+    },
+  );
+  assert.deepEqual(events.map((e) => e.event), ["response.created"]);
+});
+
+test("streamResponse releases the reader lock on early break", async () => {
+  let released = false;
+  const underlying = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('event: a\ndata: {"n":1}\n\n'));
+      controller.enqueue(new TextEncoder().encode('event: b\ndata: {"n":2}\n\n'));
+      controller.close();
+    },
+  });
+  // Wrap getReader so we can observe releaseLock being called.
+  const body = {
+    getReader() {
+      const reader = underlying.getReader();
+      const originalRelease = reader.releaseLock.bind(reader);
+      reader.releaseLock = () => {
+        released = true;
+        originalRelease();
+      };
+      return reader;
+    },
+  };
+  const client = new GeneralAugmentClient({
+    apiKey: "gaadmlive_test",
+    baseUrl: "https://api.example.test",
+    fetchImpl: async () => ({ ok: true, status: 200, headers: new Headers(), body }),
+  });
+
+  for await (const event of client.streamResponse({ input: "hi" })) {
+    assert.equal(event.event, "a");
+    break; // early exit before consuming the whole stream
+  }
+
+  assert.equal(released, true);
+});
+
+test("invalid maxRetries fails fast", () => {
+  assert.throws(
+    () =>
+      new GeneralAugmentClient({
+        apiKey: "gaadmlive_test",
+        maxRetries: -1,
+      }),
+    /maxRetries/,
+  );
 });
 
 function jsonResponse(payload, init = {}) {
