@@ -181,10 +181,10 @@ def test_auth_login_browser_flow_stores_installer_session_without_printing_token
     assert config["metadata"]["installer"]["refresh_token"] == "garefr_refresh_secret"
 
 
-def test_setup_bootstrap_uses_installer_session_without_storing_runtime_secret(
+def test_setup_bootstrap_persists_runtime_key_into_config_but_not_artifact(
     tmp_path: Path,
 ) -> None:
-    """Setup bootstrap should create tenant resources without persisting raw runtime keys."""
+    """Bootstrap should persist the minted runtime key into chmod-600 config, not artifacts."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -266,8 +266,13 @@ def test_setup_bootstrap_uses_installer_session_without_storing_runtime_secret(
     )
     persisted_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert persisted_config["active_project"] == "proj_1"
-    assert "ga_runtime_secret_once" not in config_path.read_text(encoding="utf-8")
+    # The runtime key is persisted into config so a brand-new user gets a working
+    # auth login -> setup --bootstrap -> smoke chain with no manual export.
+    assert persisted_config["api_key"] == "ga_runtime_secret_once"
+    assert config_path.stat().st_mode & 0o777 == 0o600
+    # The redacted setup artifact must never contain the raw runtime secret.
     assert "ga_runtime_secret_once" not in artifact_path.read_text(encoding="utf-8")
+    assert "ga_runtime_secret_once" not in result.output
 
 
 def test_setup_bootstrap_can_print_runtime_env_once_without_artifact_secret(
@@ -324,7 +329,10 @@ def test_setup_bootstrap_can_print_runtime_env_once_without_artifact_secret(
     artifact = workspace / ".genaug" / "setup-plan.json"
     assert artifact.exists()
     assert "ga_runtime_secret_once" not in artifact.read_text(encoding="utf-8")
-    assert "ga_runtime_secret_once" not in config_path.read_text(encoding="utf-8")
+    # --print-env still works, and the key is also persisted into chmod-600 config
+    # so the next command authenticates automatically.
+    persisted_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted_config["api_key"] == "ga_runtime_secret_once"
 
 
 def test_providers_setup_writes_installer_custody_and_health_checks(
@@ -344,6 +352,9 @@ def test_providers_setup_writes_installer_custody_and_health_checks(
         encoding="utf-8",
     )
     FakeHTTPClient.queue = [
+        json_response(
+            {"items": [{"id": "proj_1", "name": "Demo App", "slug": "demo-app"}]}
+        ),
         json_response(
             {
                 "provider": "browserbase",
@@ -381,7 +392,7 @@ def test_providers_setup_writes_installer_custody_and_health_checks(
             "--capability",
             "browse",
             "--project",
-            "proj_1",
+            "demo-app",
             "--api-key",
             "bb_secret_raw",
             "--health-check",
@@ -395,16 +406,18 @@ def test_providers_setup_writes_installer_custody_and_health_checks(
     assert payload["providers"][0]["provider"] == "browserbase"
     assert payload["providers"][0]["credential"]["status"] == "active"
     assert payload["providers"][0]["health"]["status"] == "available"
-    assert FakeHTTPClient.requests[0]["method"] == "PUT"
-    assert FakeHTTPClient.requests[0]["url"] == (
+    # The installer slug is resolved to its UUID before the typed installer route.
+    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/installer/projects"
+    assert FakeHTTPClient.requests[1]["method"] == "PUT"
+    assert FakeHTTPClient.requests[1]["url"] == (
         "http://api.test/api/v1/installer/projects/proj_1/capability-providers/browserbase"
     )
-    assert FakeHTTPClient.requests[0]["headers"] == {
+    assert FakeHTTPClient.requests[1]["headers"] == {
         "Authorization": "Bearer gainst_access_secret"
     }
-    assert FakeHTTPClient.requests[0]["json"]["api_key"] == "bb_secret_raw"
-    assert FakeHTTPClient.requests[1]["method"] == "POST"
-    assert FakeHTTPClient.requests[1]["url"].endswith(
+    assert FakeHTTPClient.requests[1]["json"]["api_key"] == "bb_secret_raw"
+    assert FakeHTTPClient.requests[2]["method"] == "POST"
+    assert FakeHTTPClient.requests[2]["url"].endswith(
         "/api/v1/installer/projects/proj_1/capability-providers/browserbase/health-check"
     )
 
@@ -426,6 +439,9 @@ def test_skills_design_can_push_starter_bundle_with_installer_auth(tmp_path: Pat
         encoding="utf-8",
     )
     FakeHTTPClient.queue = [
+        json_response(
+            {"items": [{"id": "proj_1", "name": "Demo App", "slug": "demo-app"}]}
+        ),
         json_response(
             {
                 "name": "Website Builder",
@@ -460,7 +476,7 @@ def test_skills_design_can_push_starter_bundle_with_installer_auth(tmp_path: Pat
             "--workspace",
             str(workspace),
             "--project",
-            "proj_1",
+            "demo-app",
             "--apply",
             "--json",
         ],
@@ -470,16 +486,18 @@ def test_skills_design_can_push_starter_bundle_with_installer_auth(tmp_path: Pat
     payload = json.loads(result.output)
     assert payload["applied"]["skill"]["name"] == "Website Builder"
     assert payload["applied"]["prompt_flow"]["flow_id"] == "website_builder"
-    assert FakeHTTPClient.requests[0]["method"] == "POST"
-    assert FakeHTTPClient.requests[0]["url"] == (
+    # The installer slug is resolved to its UUID before the typed installer route.
+    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/installer/projects"
+    assert FakeHTTPClient.requests[1]["method"] == "POST"
+    assert FakeHTTPClient.requests[1]["url"] == (
         "http://api.test/api/v1/installer/projects/proj_1/skills"
     )
-    assert "Build safe website previews" in FakeHTTPClient.requests[0]["json"]["content"]
-    assert FakeHTTPClient.requests[0]["headers"] == {
+    assert "Build safe website previews" in FakeHTTPClient.requests[1]["json"]["content"]
+    assert FakeHTTPClient.requests[1]["headers"] == {
         "Authorization": "Bearer gainst_access_secret"
     }
-    assert FakeHTTPClient.requests[1]["method"] == "PUT"
-    assert FakeHTTPClient.requests[1]["url"].endswith(
+    assert FakeHTTPClient.requests[2]["method"] == "PUT"
+    assert FakeHTTPClient.requests[2]["url"].endswith(
         "/api/v1/installer/projects/proj_1/prompt-flows/website_builder"
     )
 
@@ -3673,7 +3691,9 @@ def test_smoke_can_scope_management_key_to_project(tmp_path: Path) -> None:
     FakeHTTPClient.queue = [
         json_response({"status": "ready"}),
         json_response({"items": [project]}),
-        json_response({"id": "resp_smoke", "status": "completed", "output_text": "ok"}),
+        json_response(
+            {"id": "resp_smoke", "status": "completed", "output_text": "genaug-smoke-ok"}
+        ),
     ]
 
     result = CliRunner().invoke(
@@ -3699,7 +3719,7 @@ def test_smoke_json_includes_readiness_and_trace_ids(tmp_path: Path) -> None:
             {
                 "id": "resp_smoke",
                 "status": "completed",
-                "output_text": "ok",
+                "output_text": "genaug-smoke-ok",
                 "metadata": {
                     "general_augment_cost_usd": 0.004,
                     "general_augment_request_id": "req_1",
@@ -3753,7 +3773,7 @@ def test_smoke_writes_launch_evidence_with_support_bundle(tmp_path: Path) -> Non
                 "id": "resp_smoke",
                 "status": "completed",
                 "model": "mock/balanced",
-                "output_text": "ok",
+                "output_text": "genaug-smoke-ok",
                 "metadata": {
                     "general_augment_request_id": "req_1",
                     "general_augment_trace_id": "trace_1",
@@ -3851,6 +3871,318 @@ def test_smoke_can_load_structured_schema_file(tmp_path: Path) -> None:
     assert result.exit_code == 0
     payload = FakeHTTPClient.requests[1]["json"]
     assert payload["text"]["format"]["schema"]["required"] == ["summary"]
+
+
+def test_smoke_fails_on_empty_agent_reply(tmp_path: Path) -> None:
+    """An HTTP 200 with an empty body must fail so agents gating on exit code are safe."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response({"id": "resp_smoke", "status": "completed", "output_text": ""}),
+    ]
+
+    result = CliRunner().invoke(app, ["--config", str(config_path), "smoke", "--json"])
+
+    assert result.exit_code != 0
+    payload = first_json_object(result.output)
+    assert payload["verdict"] == "FAIL"
+    assert "empty response body" in payload["verdict_detail"]
+    assert "genaug smoke" in payload["verdict_detail"]
+
+
+def test_smoke_fails_when_agent_does_not_echo_expected_token(tmp_path: Path) -> None:
+    """A wrong reply to the built-in prompt must fail even on HTTP 200."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response(
+            {"id": "resp_smoke", "status": "completed", "output_text": "totally unrelated"}
+        ),
+    ]
+
+    result = CliRunner().invoke(app, ["--config", str(config_path), "smoke", "--json"])
+
+    assert result.exit_code != 0
+    payload = first_json_object(result.output)
+    assert payload["verdict"] == "FAIL"
+    assert "genaug-smoke-ok" in payload["verdict_detail"]
+
+
+def test_smoke_passes_on_good_reply(tmp_path: Path) -> None:
+    """A well-formed reply that echoes the token should pass with exit 0."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response(
+            {"id": "resp_smoke", "status": "completed", "output_text": "genaug-smoke-ok"}
+        ),
+    ]
+
+    result = CliRunner().invoke(app, ["--config", str(config_path), "smoke", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "PASS"
+
+
+def test_smoke_fails_on_bad_structured_output(tmp_path: Path) -> None:
+    """Structured smoke must fail when the model does not satisfy the built-in schema."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response(
+            {
+                "id": "resp_smoke",
+                "status": "completed",
+                "output_text": '{"ok": false, "label": "nope"}',
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app, ["--config", str(config_path), "smoke", "--structured", "--json"]
+    )
+
+    assert result.exit_code != 0
+    payload = first_json_object(result.output)
+    assert payload["verdict"] == "FAIL"
+
+
+def test_keys_create_json_includes_one_time_secret(tmp_path: Path) -> None:
+    """keys create --json must emit the one-time secret so an agent can capture it."""
+    config_path = write_config(tmp_path)
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "id": "key/1",
+                "name": "Production backend",
+                "api_key": "gaadmlive_secret",
+                "masked_key": "gaadmlive_s...cret",
+                "project_id": "proj/1",
+                "scopes": ["admin"],
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "keys",
+            "create",
+            "--name",
+            "Production backend",
+            "--project",
+            "dayplan",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["api_key"] == "gaadmlive_secret"
+    assert payload["id"] == "key/1"
+
+
+def test_auth_login_json_is_machine_readable_without_leaking_key(tmp_path: Path) -> None:
+    """auth login --json should report verified auth metadata but never the raw key."""
+    config_path = tmp_path / "config.yaml"
+    FakeHTTPClient.queue = [
+        json_response({"auth_method": "api_key", "project_id": "p1", "project_ids": ["p1"]}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "auth",
+            "login",
+            "--api-key",
+            "super-secret-key",
+            "--base-url",
+            "http://api.test",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["authenticated"] is True
+    assert payload["auth_method"] == "api_key"
+    assert payload["verified"] is True
+    assert "super-secret-key" not in result.output
+
+
+def test_deploy_json_emits_project_payload(tmp_path: Path) -> None:
+    """deploy --json should emit the raw project payload for automation."""
+    config_path = write_config(tmp_path)
+    agent_config = write_agent_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"items": []}),
+        json_response({"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "deploy", str(agent_config), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["id"] == "proj/1"
+    assert payload["slug"] == "dayplan"
+
+
+def test_integrate_json_emits_tool_summary(tmp_path: Path) -> None:
+    """integrate --json should emit a machine-readable scaffold summary."""
+    spec_path = ROOT / "tests/fixtures/sample_openapi_specs/health_app_api.yaml"
+    output_dir = tmp_path / "mysti-agent"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "integrate",
+            str(spec_path),
+            "--name",
+            "mysti",
+            "--output-dir",
+            str(output_dir),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["deployed"] is False
+    assert isinstance(payload["tools"], list)
+    assert payload["tools"]
+    assert {"tool_id", "http_method", "risk_level", "enabled"} <= set(payload["tools"][0])
+
+
+def test_setup_bootstrap_persisted_key_authenticates_smoke_without_export(
+    tmp_path: Path,
+) -> None:
+    """After bootstrap, smoke should authenticate from saved config with no manual export."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": None,
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    FakeHTTPClient.queue = [
+        json_response({"items": []}),
+        json_response({"id": "proj_1", "name": "Demo App", "slug": "demo-app"}),
+        json_response(
+            {
+                "id": "key_1",
+                "name": "Self-serve app backend",
+                "api_key": "ga_runtime_secret_once",
+                "masked_key": "ga...once",
+                "project_id": "proj_1",
+                "scopes": ["responses:create"],
+            }
+        ),
+    ]
+
+    bootstrap = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "setup",
+            "--workspace",
+            str(workspace),
+            "--bootstrap",
+            "--project-name",
+            "Demo App",
+            "--project-slug",
+            "demo-app",
+            "--json",
+        ],
+    )
+    assert bootstrap.exit_code == 0, bootstrap.output
+
+    # No manual export: smoke reads the persisted runtime key from config.
+    FakeHTTPClient.requests = []
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response(
+            {"id": "resp_smoke", "status": "completed", "output_text": "genaug-smoke-ok"}
+        ),
+    ]
+    smoke_result = CliRunner().invoke(app, ["--config", str(config_path), "smoke", "--json"])
+
+    assert smoke_result.exit_code == 0, smoke_result.output
+    payload = json.loads(smoke_result.output)
+    assert payload["verdict"] == "PASS"
+    # The persisted runtime key authenticated the app-facing responses call.
+    assert FakeHTTPClient.requests[1]["headers"]["Authorization"] == (
+        "Bearer ga_runtime_secret_once"
+    )
+
+
+def test_installer_slug_resolves_to_uuid_before_typed_route(tmp_path: Path) -> None:
+    """Installer setup must resolve a slug to its UUID so typed routes do not 422."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": None,
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "items": [
+                    {
+                        "id": "11111111-1111-4111-8111-111111111111",
+                        "name": "Demo App",
+                        "slug": "demo-app",
+                    }
+                ]
+            }
+        ),
+        json_response({"provider": "browserbase", "status": "active"}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "providers",
+            "setup",
+            "--capability",
+            "browse",
+            "--project",
+            "demo-app",
+            "--api-key",
+            "bb_secret_raw",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/installer/projects"
+    assert FakeHTTPClient.requests[1]["url"] == (
+        "http://api.test/api/v1/installer/projects/"
+        "11111111-1111-4111-8111-111111111111/capability-providers/browserbase"
+    )
 
 
 def test_doctor_checks_config_health_and_auth(tmp_path: Path) -> None:

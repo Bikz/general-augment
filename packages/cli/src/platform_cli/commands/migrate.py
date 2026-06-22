@@ -10,7 +10,7 @@ import typer
 
 from platform_cli.errors import CLIError
 from platform_cli.openai_responses_migration import plan_openai_responses_migration
-from platform_cli.output import print_json, print_success, table
+from platform_cli.output import print_json, print_success, print_warning, table
 from platform_cli.runtime import Runtime
 from platform_cli.self_serve import artifact_dir, build_setup_payload, write_payload
 
@@ -69,8 +69,12 @@ def migrate_openai_responses(
     artifact_path = write_payload(payload, output, workspace)
     payload["artifact_path"] = str(artifact_path)
     artifact_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    changed = bool(migration.get("changed"))
+    warnings: list[str] = migration.get("warnings", [])
     if json_output:
         print_json(payload)
+        if not changed:
+            raise typer.Exit(1)
         return
     table(
         "OpenAI Responses migration",
@@ -82,6 +86,14 @@ def migrate_openai_responses(
             ["Artifact", artifact_path],
         ],
     )
+    for warning in warnings:
+        print_warning(f"Needs attention: {warning}")
+    if not changed:
+        print_warning(
+            "No OpenAI client config was migrated. Review the warnings above and "
+            "migrate any clients manually; nothing in your app was changed."
+        )
+        raise typer.Exit(1)
     print_success(
         "Migration edits applied."
         if should_apply

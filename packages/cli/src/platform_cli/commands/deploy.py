@@ -10,7 +10,7 @@ import typer
 from platform_cli.client import encode_path_segment, resolve_project
 from platform_cli.errors import CLIError
 from platform_cli.openapi import load_deploy_payload, project_name_from_config
-from platform_cli.output import panel, print_success
+from platform_cli.output import panel, print_json, print_success
 from platform_cli.runtime import Runtime
 
 
@@ -28,13 +28,25 @@ def deploy(
         str | None,
         typer.Option("--project", help="Project id, slug, or name."),
     ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print machine-readable JSON."),
+    ] = False,
 ) -> None:
     """Validate and upload a local agent manifest."""
     runtime: Runtime = ctx.obj
-    deploy_path(runtime, config_path, project_ref=project)
+    response = deploy_path(runtime, config_path, project_ref=project, quiet=json_output)
+    if json_output:
+        print_json(response)
 
 
-def deploy_path(runtime: Runtime, config_path: Path, project_ref: str | None) -> dict[str, Any]:
+def deploy_path(
+    runtime: Runtime,
+    config_path: Path,
+    project_ref: str | None,
+    *,
+    quiet: bool = False,
+) -> dict[str, Any]:
     """Deploy a local config path."""
     payload = load_deploy_payload(config_path)
     local_name = project_ref or project_name_from_config(config_path)
@@ -62,11 +74,12 @@ def deploy_path(runtime: Runtime, config_path: Path, project_ref: str | None) ->
             )
             action = "created"
     name = response.get("name") or response.get("slug") or local_name
-    print_success(f"Project {action}: {name}")
-    panel(
-        "Webhook URLs",
-        f"WhatsApp: {runtime.config.base_url}/api/v1/webhooks/whatsapp\n"
-        f"Telegram: {runtime.config.base_url}/api/v1/webhooks/telegram\n"
-        f"SMS: {runtime.config.base_url}/api/v1/webhooks/sms",
-    )
+    if not quiet:
+        print_success(f"Project {action}: {name}")
+        panel(
+            "Webhook URLs",
+            f"WhatsApp: {runtime.config.base_url}/api/v1/webhooks/whatsapp\n"
+            f"Telegram: {runtime.config.base_url}/api/v1/webhooks/telegram\n"
+            f"SMS: {runtime.config.base_url}/api/v1/webhooks/sms",
+        )
     return response

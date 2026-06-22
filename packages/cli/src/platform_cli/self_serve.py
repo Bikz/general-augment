@@ -6,8 +6,10 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from platform_cli.config import DEFAULT_BASE_URL, CLIConfig
+from platform_cli.errors import CLIError
 from platform_cli.workspace_inspector import inspect_workspace
 
 SCHEMA_VERSION = "general-augment-self-serve-setup/v1"
@@ -127,6 +129,37 @@ def installer_auth_metadata(config: CLIConfig) -> dict[str, Any] | None:
     if not isinstance(installer, dict) or not installer.get("access_token"):
         return None
     return installer
+
+
+def resolve_installer_project_id(client: Any, *, token: str, project_ref: str) -> str:
+    """Resolve a project id, slug, or name to its UUID via the installer listing.
+
+    Installer routes type the project path param as a UUID, so a slug/name must be
+    resolved before interpolation or the backend returns 422.
+    """
+    if _looks_like_uuid(project_ref):
+        return project_ref
+    payload = client.installer("GET", "/projects", token=token)
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if project_ref in {
+            str(item.get("id", "")),
+            str(item.get("slug", "")),
+            str(item.get("name", "")),
+        }:
+            return str(item.get("id") or project_ref)
+    raise CLIError(f"Project not found: {project_ref}")
+
+
+def _looks_like_uuid(value: str) -> bool:
+    """Return whether a project ref is already a canonical UUID."""
+    try:
+        UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
 
 
 def normalize_capabilities(capabilities: list[str]) -> list[str]:
@@ -338,7 +371,12 @@ def next_actions(
 
 
 def dashboard_project_url(project: str | None, *, base_url: str = DEFAULT_DASHBOARD_URL) -> str:
-    """Build a dashboard URL for a project or the project picker."""
+    """Build a dashboard URL for a project or the project picker.
+
+    The Next.js dashboard renders a project at /dashboard/projects/<id>, so this
+    is the single source of truth every CLI command uses for project links.
+    """
+    base = base_url.rstrip("/")
     if not project:
-        return f"{base_url}/projects"
-    return f"{base_url}/projects/{project}"
+        return f"{base}/dashboard/projects"
+    return f"{base}/dashboard/projects/{project}"

@@ -14,6 +14,7 @@ from platform_cli.errors import CLIError
 from platform_cli.output import panel, print_json, table
 from platform_cli.readiness import build_readiness_checklist
 from platform_cli.runtime import Runtime
+from platform_cli.self_serve import dashboard_project_url
 
 
 def verify(
@@ -543,9 +544,10 @@ def _runtime_policy_artifact(payload: object) -> dict[str, Any]:
 def _dashboard_links(dashboard_url: str, project_id: str) -> dict[str, str]:
     """Build dashboard URLs for UI follow-up checks."""
 
-    base = dashboard_url.rstrip("/")
-    encoded = encode_path_segment(project_id)
-    project_root = f"{base}/dashboard/projects/{encoded}"
+    project_root = dashboard_project_url(
+        encode_path_segment(project_id),
+        base_url=dashboard_url.rstrip("/"),
+    )
     return {
         "project": project_root,
         "integrate": f"{project_root}/integrate",

@@ -12,7 +12,7 @@ import typer
 from rich.prompt import Prompt
 
 from platform_cli.config import clear_config, save_config
-from platform_cli.output import panel, print_success
+from platform_cli.output import panel, print_json, print_success
 from platform_cli.runtime import Runtime
 
 app = typer.Typer(help="Authenticate the CLI.")
@@ -41,6 +41,7 @@ def login(
         "--skip-verify",
         help="Store the key without calling the platform API.",
     ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Authenticate with browser installer auth or a provided API key."""
     runtime = _runtime(ctx)
@@ -51,6 +52,7 @@ def login(
             open_browser=open_browser,
             authorization_code=authorization_code,
             code_verifier=code_verifier,
+            json_output=json_output,
         )
         return
     key = api_key
@@ -70,6 +72,21 @@ def login(
         with verify_runtime.client() as client:
             identity = client.admin("GET", "/me")
     path = save_config(next_config, runtime.config_path)
+    if json_output:
+        # Never echo the key itself; only safe, redacted auth metadata.
+        print_json(
+            {
+                "authenticated": True,
+                "auth_method": str(identity.get("auth_method", "api_key"))
+                if identity is not None
+                else "api_key",
+                "base_url": next_config.base_url,
+                "config_path": str(path),
+                "project_scope": _project_scope(identity) if identity is not None else None,
+                "verified": identity is not None,
+            }
+        )
+        return
     print_success(f"Authenticated. Config saved to {path}")
     if identity is not None:
         print_success(
@@ -85,6 +102,7 @@ def _browser_login(
     open_browser: bool,
     authorization_code: str | None,
     code_verifier: str | None,
+    json_output: bool = False,
 ) -> None:
     """Run the browser/PKCE installer auth path."""
     verifier = code_verifier or secrets.token_urlsafe(48)
@@ -113,8 +131,9 @@ def _browser_login(
             },
         )
         authorize_url = str(start.get("authorize_url", ""))
-        print_success("Browser authorization started.")
-        typer.echo(f"Open: {authorize_url}")
+        if not json_output:
+            print_success("Browser authorization started.")
+            typer.echo(f"Open: {authorize_url}")
         if open_browser and authorize_url:
             webbrowser.open(authorize_url)
         code = authorization_code or Prompt.ask("Authorization code")
@@ -148,6 +167,20 @@ def _browser_login(
         }
     )
     path = save_config(next_config, runtime.config_path)
+    if json_output:
+        # Tokens stay out of output; only safe installer identity metadata is emitted.
+        print_json(
+            {
+                "authenticated": True,
+                "auth_method": str(identity.get("auth_method", "installer")),
+                "base_url": base_url,
+                "config_path": str(path),
+                "project_scope": _project_scope(identity),
+                "active_project": next_config.active_project,
+                "verified": True,
+            }
+        )
+        return
     print_success(f"Authenticated with browser installer auth. Config saved to {path}")
     print_success(f"Installer projects: {_project_scope(identity)}")
 

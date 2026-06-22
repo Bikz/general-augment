@@ -196,6 +196,156 @@ def test_migrate_openai_responses_apply_requires_explicit_yes(tmp_path: Path) ->
     assert "GENAUG_API_BASE_URL" in env_example
 
 
+def _migrate(workspace: Path, *extra: str) -> object:
+    return CliRunner().invoke(
+        app,
+        ["migrate", "openai-responses", "--workspace", str(workspace), "--json", *extra],
+    )
+
+
+def test_migrate_python_openai_app_is_migrated(tmp_path: Path) -> None:
+    """A Python OpenAI app should get base_url + key env redirected (was a silent no-op)."""
+    workspace = tmp_path / "app"
+    workspace.mkdir()
+    source = workspace / "agent.py"
+    source.write_text(
+        "import os\n"
+        "from openai import OpenAI\n\n"
+        'client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])\n\n'
+        "def run(text):\n"
+        '    return client.responses.create(model="gpt-5.1", input=text)\n',
+        encoding="utf-8",
+    )
+
+    result = _migrate(workspace, "--apply", "--yes")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["migration"]["changed"] is True
+    assert "agent.py" in payload["migration"]["diff_files"]
+    updated = source.read_text(encoding="utf-8")
+    assert 'os.environ["GENAUG_API_KEY"]' in updated
+    assert "GENAUG_OPENAI_BASE_URL" in updated
+    assert "base_url=" in updated
+    # The result must still be valid Python.
+    import ast
+
+    ast.parse(updated)
+
+
+def test_migrate_js_standard_env_var(tmp_path: Path) -> None:
+    """Standard JS OpenAI client gets baseURL injected and key swapped."""
+    workspace = tmp_path / "app"
+    workspace.mkdir()
+    source = workspace / "agent.ts"
+    source.write_text(
+        "import OpenAI from 'openai';\n"
+        "const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });\n",
+        encoding="utf-8",
+    )
+
+    result = _migrate(workspace, "--apply", "--yes")
+
+    assert result.exit_code == 0, result.output
+    updated = source.read_text(encoding="utf-8")
+    assert "process.env.GENAUG_API_KEY" in updated
+    assert "baseURL: process.env.GENAUG_OPENAI_BASE_URL" in updated
+
+
+def test_migrate_js_nonstandard_key_not_redirected(tmp_path: Path) -> None:
+    """A non-standard key must NOT be silently sent to GA; warn + leave a TODO instead."""
+    workspace = tmp_path / "app"
+    workspace.mkdir()
+    source = workspace / "agent.ts"
+    original = (
+        "import OpenAI from 'openai';\n"
+        "const client = new OpenAI({ apiKey: process.env.AZURE_OPENAI_KEY });\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    result = _migrate(workspace, "--apply", "--yes")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    updated = source.read_text(encoding="utf-8")
+    # Foreign key is left as-is, not repointed to GA.
+    assert "process.env.AZURE_OPENAI_KEY" in updated
+    assert "process.env.GENAUG_API_KEY" not in updated
+    assert "TODO(genaug)" in updated
+    assert any("non-standard" in w for w in payload["migration"]["warnings"])
+
+
+def test_migrate_js_positional_constructor_warns_and_skips(tmp_path: Path) -> None:
+    """Positional `new OpenAI(key)` cannot get a baseURL; warn-and-skip, do not half-migrate."""
+    workspace = tmp_path / "app"
+    workspace.mkdir()
+    source = workspace / "agent.ts"
+    original = (
+        "import OpenAI from 'openai';\n"
+        "const client = new OpenAI(process.env.OPENAI_API_KEY);\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    result = _migrate(workspace)
+
+    payload = json.loads(result.output)
+    # Source is untouched (no baseURL injected, key not swapped).
+    assert source.read_text(encoding="utf-8") == original
+    assert any("positional" in w for w in payload["migration"]["warnings"])
+    # Nothing migrated in code, only env.example planned -> still surfaces as changed=env.
+    assert "agent.ts" not in payload["migration"]["diff_files"]
+
+
+def test_migrate_env_var_without_client_is_not_clobbered(tmp_path: Path) -> None:
+    """A file that mentions OPENAI_API_KEY but constructs no client is left alone."""
+    workspace = tmp_path / "app"
+    workspace.mkdir()
+    # No OpenAI client anywhere -> nothing to migrate.
+    source = workspace / "config.ts"
+    original = "export const key = process.env.OPENAI_API_KEY;\n"
+    source.write_text(original, encoding="utf-8")
+
+    result = _migrate(workspace)
+
+    payload = json.loads(result.output)
+    assert source.read_text(encoding="utf-8") == original
+    # No client constructed anywhere -> nothing changed, honest non-success exit.
+    assert payload["migration"]["changed"] is False
+    assert result.exit_code != 0
+
+
+def test_migrate_dry_run_writes_nothing_to_app_tree_and_diff_includes_env(
+    tmp_path: Path,
+) -> None:
+    """Dry-run must not touch the app tree, and the preview diff must include env changes."""
+    workspace = tmp_path / "app"
+    workspace.mkdir()
+    source = workspace / "agent.ts"
+    original = (
+        "import OpenAI from 'openai';\n"
+        "const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });\n"
+    )
+    source.write_text(original, encoding="utf-8")
+    before = sorted(p.name for p in workspace.iterdir())
+
+    result = _migrate(workspace, "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    # App source untouched.
+    assert source.read_text(encoding="utf-8") == original
+    # No .env / .env.example written into the app tree on dry-run.
+    assert not (workspace / ".env.example").exists()
+    # Only the .genaug artifact dir is added beyond the original files.
+    after = sorted(p.name for p in workspace.iterdir())
+    assert set(after) - set(before) <= {".genaug"}
+    # Preview diff must show BOTH the code change and the env change.
+    diff = Path(payload["migration"]["diff_path"]).read_text(encoding="utf-8")
+    assert "GENAUG_OPENAI_BASE_URL" in diff
+    assert ".env.example" in diff
+    assert "GENAUG_PROJECT_ID" in diff
+
+
 def test_setup_subcommands_are_agent_friendly_json(tmp_path: Path) -> None:
     """Provider, connector, skill, and dashboard helpers should expose machine-readable setup."""
     workspace = tmp_path / "app"
@@ -235,4 +385,7 @@ def test_setup_subcommands_are_agent_friendly_json(tmp_path: Path) -> None:
         "genaug mcp add"
     )
     assert json.loads(skills.output)["skill"]["name"] == "Website Builder"
-    assert json.loads(dashboard.output)["url"] == "https://app.generalaugment.com/projects/demo-agent"
+    assert (
+        json.loads(dashboard.output)["url"]
+        == "https://app.generalaugment.com/dashboard/projects/demo-agent"
+    )

@@ -7,7 +7,7 @@ from typing import Annotated
 import typer
 
 from platform_cli.client import encode_path_segment, resolve_project
-from platform_cli.output import panel, print_success, print_warning, table
+from platform_cli.output import panel, print_json, print_success, print_warning, table
 from platform_cli.runtime import Runtime
 
 app = typer.Typer(help="Manage project-scoped API keys.")
@@ -46,6 +46,7 @@ def create_key(
         typer.Option("--scope", help="Scope to grant; repeatable."),
     ] = None,
     expires_at: str | None = typer.Option(None, help="Optional ISO-8601 expiration timestamp."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Create an API key and print the raw secret once."""
 
@@ -61,6 +62,10 @@ def create_key(
         if expires_at is not None:
             payload["expires_at"] = expires_at
         response = client.admin("POST", "/keys", json=payload)
+    if json_output:
+        # Agents capture the one-time secret here; this is the intended reveal.
+        print_json(response)
+        return
     print_success(
         f"Created API key {response.get('name', name)} ({response.get('id', 'unknown')})."
     )
