@@ -8,19 +8,16 @@ governed agent layer around those app systems.
 
 | Surface | What It Is For | Human Path | Agent/CLI Path |
 | --- | --- | --- | --- |
-| Dashboard | Project setup, API keys, model providers, tools, channels, usage, traces, users, billing | https://app.generalaugment.com | `genaug projects list` |
+| Dashboard | Project setup, API keys, providers, tools, usage, traces | https://app.generalaugment.com | `genaug dashboard open` |
 | Self-serve setup | Install/configure General Augment without code edits | CLI browser consent | `genaug auth login`, `genaug setup --bootstrap` |
 | Safe migration | Patch an existing OpenAI Responses app after diff review | PR or local diff review | `genaug migrate openai-responses` |
 | Responses API | App backend agent turns | App backend code | Python SDK, TypeScript SDK, raw HTTP |
-| Capability providers | Tenant-owned coding, browser, search, video, and model/API capacity | Project provider panels | `genaug providers setup`, `genaug model-providers` |
-| Tools | Governed app/API actions and BYO local connector capabilities | Project tools pages | `genaug integrate`, `genaug tools`, `genaug mcp`, `genaug connectors setup` |
+| Capability providers | Tenant-owned coding, browser, search, video, and model/API capacity | Project provider panels | `genaug providers setup`, `genaug providers smoke` |
+| Tools | Governed app/API actions and BYO local connector capabilities | Project tools pages | `genaug integrate`, `genaug tools`, `genaug connectors setup` |
 | Skills | Durable tenant behavior guidance | Project skills pages | `genaug skills design`, `genaug skills apply` |
-| Memory | User-scoped durable facts | User/memory views | SDK memory methods, `genaug memory` |
-| Identity | Map app users to General Augment users and channels | Identity views | `genaug identity` |
-| Channels | Telegram, WhatsApp, SMS, and other delivery surfaces | Channel setup flows | `genaug channels` |
-| Observability | Traces, logs, support bundles, usage evidence | Observability views | `genaug logs`, `genaug observability` |
-| Approvals | Human approval for sensitive tool actions | Approval queue | `genaug approvals` |
-| Billing/usage | Plan limits, checkout/portal handoff, usage events | Billing and usage pages | `genaug billing`, `genaug projects usage` |
+| Memory | User-scoped durable facts | User/memory views | SDK memory methods (`store_memory`, `search_memory`, ...) |
+| Identity | Map app users to General Augment users and channels | Identity views | SDK identity methods (`link_user`, `resolve_user`, `unlink_user`) |
+| Verification | Project acceptance proof and launch evidence | Dashboard review | `genaug smoke`, `genaug verify` |
 
 ## Recommended Integration Order
 
@@ -30,16 +27,15 @@ governed agent layer around those app systems.
    and apply only after reviewing the diff.
 4. Store the project runtime key in the app backend.
 5. Run `genaug smoke --evidence-output .genaug/smoke-evidence.json --json` against `/v1/responses`.
-6. Add tenant-owned model provider credentials when production traffic should use the
+6. Add tenant-owned provider credentials when production traffic should use the
    tenant's own provider account.
 7. Add generated OpenAPI tools, MCP servers, or BYO local connectors for private
    capacity.
 8. Add skills and SOUL/personality guidance.
 9. Add memory only for durable user facts the app is allowed to retain.
-10. Add identity linking and external channels if users will interact outside the app UI.
-11. Verify traces, usage, support bundles, and approval behavior.
-12. Run `genaug verify --json`, `genaug onboarding verify --json`, and
-    `genaug dashboard open --project <project>`.
+10. Add identity linking from backend SDK code if users will interact outside the app UI.
+11. Verify traces, usage, and tool behavior.
+12. Run `genaug verify --json` and `genaug dashboard open --project <project>`.
 
 ## Responses API
 
@@ -68,15 +64,17 @@ memory facts, docs, screenshots, or support artifacts.
 
 ```bash
 genaug providers setup --capability browse --project my-agent --api-key-env BROWSERBASE_API_KEY --health-check
-genaug model-providers set openai \
-  --project my-agent \
-  --api-key "$OPENAI_API_KEY"
-
-genaug model-providers health openai --project my-agent --json
-genaug model-providers list --project my-agent
+genaug providers setup --provider codex-mcp --project my-agent --api-key-env OPENAI_API_KEY --health-check
+genaug providers smoke --capability code --capability browse --json
+genaug providers readiness --project my-agent --json
 ```
 
-## Tools, MCP, And Approvals
+`providers setup` reads the named env var once, stores the credential in General Augment
+custody, runs a health check, and writes only redacted setup evidence. `providers smoke`
+plans launch evidence per capability or provider; `providers readiness` reports the
+provider readiness rows for the project.
+
+## Tools, MCP, And Connectors
 
 Use OpenAPI specs for app-owned APIs and MCP for external tool surfaces when the
 credential and audit boundary is acceptable.
@@ -89,24 +87,20 @@ iMessage should use this pattern through a tenant-owned Mac rather than raw shel
 direct adapter access.
 
 ```bash
-genaug integrate ./openapi.yaml --name my-agent --auto-deploy
+genaug integrate ./openapi.yaml --auto-deploy
 genaug connectors setup --name browserbase \
   --url 'https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}' \
   --health-check
 genaug tools list --project my-agent
 genaug tools toggle delete_account --project my-agent --disable
-genaug tools discovery --project my-agent --mode always --json
-genaug mcp add github --project my-agent --url https://example.com/mcp
-genaug mcp test github --project my-agent
+genaug tools discovery --project my-agent --json
+genaug tools add-mcp github --project my-agent --url https://example.com/mcp
 ```
 
-For destructive, expensive, or user-visible actions, require approvals:
-
-```bash
-genaug approvals list --project my-agent --json
-genaug approvals approve <approval-id> --project my-agent --yes
-genaug approvals deny <approval-id> --project my-agent --yes
-```
+Use exactly one transport per MCP server: `--url` for HTTP endpoints or `--command`
+for stdio servers. For destructive, expensive, or user-visible actions, keep the tool
+disabled by default (`genaug tools toggle <tool> --disable`) until the app owner accepts
+the risk and an approval policy is in place.
 
 ## Skills And Behavior
 
@@ -125,67 +119,61 @@ regulated data in skills.
 ## Memory
 
 Use memory for durable facts that improve product behavior. Keep sensitive data out
-unless the launch scope explicitly permits it.
+unless the launch scope explicitly permits it. Memory is called from backend code
+through the SDK, not a CLI command.
 
-```bash
-genaug memory store --project my-agent --user app-user-123 \
-  --fact "User prefers concise updates" \
-  --fact-type preference
-genaug memory search --project my-agent --user app-user-123 --query "updates"
-genaug memory profile --project my-agent --user app-user-123
-genaug memory purge-user --project my-agent --user app-user-123 --yes
+```python
+client.store_memory(
+    {
+        "user_id": "app-user-123",
+        "fact": "User prefers concise updates",
+        "fact_type": "preference",
+    }
+)
+client.search_memory({"user_id": "app-user-123", "query": "updates"})
+client.memory_profile("app-user-123")
+client.purge_user_memory("app-user-123")
 ```
 
-## Identity And Channels
+## Identity
 
-Map every external identity back to a stable app user ID.
+Map every external identity back to a stable app user ID. Identity linking is called
+from backend code through the SDK.
 
-```bash
-genaug identity list --project my-agent
-genaug identity link-user --project my-agent \
-  --external-user-id app-user-123 \
-  --provider telegram \
-  --provider-user-id telegram-user-123
-genaug channels status --project my-agent
-genaug channels test telegram --project my-agent
+```python
+client.link_user(
+    "project_123",
+    phone="+15555550123",
+    app_user_id="app-user-123",
+    provider_name="app",
+)
+client.resolve_user("project_123", "+15555550123")
+client.unlink_user("project_123", "+15555550123")
 ```
 
 ## Observability And Support
 
 When debugging, keep a redacted support receipt instead of screenshots or raw logs.
+The CLI captures this evidence through `smoke`:
 
 ```bash
 genaug smoke --project my-agent --evidence-output .genaug/smoke-evidence.json --json
-genaug smoke --project my-agent --include-support-bundle --evidence-output artifacts/smoke-evidence.json --json
-genaug logs --project my-agent --follow
-genaug observability trace <trace-id> --project my-agent --json
-genaug observability support-bundle --project my-agent --json
+genaug smoke --project my-agent --include-support-bundle \
+  --evidence-output artifacts/smoke-evidence.json --json
 ```
 
 The useful proof fields are response ID, request ID, trace ID, model/provider metadata,
-usage metadata, stable reason codes, and the exact command that failed.
-
-## Billing And Usage
-
-General Augment records usage events and enforces finite plan limits. Provider/API bills
-normally stay with the tenant's provider account during the first launch phase.
-
-```bash
-genaug projects usage --project my-agent --json
-genaug billing checkout --project my-agent --tier pro
-genaug billing portal --project my-agent
-genaug billing events --project my-agent --json
-```
-
-Do not treat usage events or Stripe meter exports as an invoice by themselves unless a
-commercial agreement says so.
+usage metadata, stable reason codes, and the exact command that failed. The evidence
+file also includes the dashboard observability URL for the same trace.
 
 ## Local Mock And Contract Tests
 
-Use the CLI mock for app CI before pointing tests at the hosted API.
+Use the CLI mock for app CI before pointing tests at the hosted API. It ships with the
+CLI package and is launched as a Python module (not a `genaug` subcommand):
 
 ```bash
-genaug mock --host 127.0.0.1 --port 8787 --quiet
+uv run --project packages/cli python -m platform_cli.local_mock \
+  --host 127.0.0.1 --port 8787 --quiet
 export GENAUG_API_BASE_URL=http://127.0.0.1:8787
 export GENAUG_API_KEY=local-test
 python examples/python-response.py
@@ -198,7 +186,7 @@ A real launch proof should include:
 
 - public package install proof;
 - dashboard project setup proof;
-- model-provider health evidence when using tenant-owned capacity;
+- provider health evidence when using tenant-owned capacity;
 - `/v1/responses` smoke with response ID and trace ID;
 - smoke evidence JSON with dashboard observability links;
 - memory behavior proof if memory is in scope;

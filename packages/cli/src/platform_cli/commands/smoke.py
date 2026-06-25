@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
@@ -14,11 +15,15 @@ import typer
 from platform_cli.client import encode_path_segment, resolve_project
 from platform_cli.errors import CLIError
 from platform_cli.output import panel, print_json, print_success, table
+from platform_cli.redaction import redact_metadata
 from platform_cli.runtime import Runtime
 from platform_cli.self_serve import DEFAULT_DASHBOARD_URL, dashboard_project_url
 
 DEFAULT_SMOKE_MESSAGE = "Reply exactly with: genaug-smoke-ok"
 DEFAULT_STRUCTURED_MESSAGE = 'Return JSON with ok=true and label="genaug-smoke-ok".'
+DEFAULT_MEMORY_RECALL_MESSAGE = (
+    "Use durable memory for this user. Reply with only the General Augment smoke recall code."
+)
 EXPECTED_SMOKE_TOKEN = "genaug-smoke-ok"
 _COMPLETED_STATUSES = {"completed", "complete", ""}
 DEFAULT_STRUCTURED_SCHEMA: dict[str, Any] = {
@@ -83,6 +88,13 @@ def smoke(
             help="Write redacted smoke evidence JSON for launch/support review.",
         ),
     ] = None,
+    import_evidence: Annotated[
+        bool,
+        typer.Option(
+            "--import-evidence",
+            help="Retain the smoke evidence in project launch-readiness audit metadata.",
+        ),
+    ] = False,
     include_support_bundle: Annotated[
         bool,
         typer.Option(
@@ -90,22 +102,34 @@ def smoke(
             help="Fetch and embed the project support bundle; requires --project and admin auth.",
         ),
     ] = False,
+    memory_recall: Annotated[
+        bool,
+        typer.Option(
+            "--memory-recall",
+            help="Seed and verify durable-memory recall through the app-facing Responses path.",
+        ),
+    ] = False,
 ) -> None:
     """Run health plus one `/v1/responses` smoke request."""
     runtime: Runtime = ctx.obj
     if include_support_bundle and not project:
         raise CLIError("--include-support-bundle requires --project.")
+    if import_evidence and not project:
+        raise CLIError("--import-evidence requires --project.")
     turn_id = uuid.uuid4().hex[:12]
     schema = _load_schema(schema_file) if schema_file else None
     structured = structured or schema is not None
+    if structured and message == DEFAULT_SMOKE_MESSAGE:
+        message = DEFAULT_STRUCTURED_MESSAGE
+    memory_recall_code = f"genaug-memory-{turn_id}" if memory_recall else None
+    if memory_recall and message == DEFAULT_SMOKE_MESSAGE:
+        message = DEFAULT_MEMORY_RECALL_MESSAGE
     # We can only assert the exact echoed token for the built-in prompts and the
-    # built-in schema. A custom --message or --schema-file means we only require a
-    # well-formed, non-empty response (or valid JSON for structured output).
+    # built-in schema. A custom --message/--schema-file or the memory-recall prompt
+    # means we only require a well-formed, non-empty response (or valid JSON).
     expects_default_token = (
         message in {DEFAULT_SMOKE_MESSAGE, DEFAULT_STRUCTURED_MESSAGE} and schema is None
     )
-    if structured and message == DEFAULT_SMOKE_MESSAGE:
-        message = DEFAULT_STRUCTURED_MESSAGE
     headers = _correlation_headers(
         idempotency_key=idempotency_key or f"genaug-smoke-{turn_id}",
         request_id=request_id or f"req_genaug_smoke_{turn_id}",
@@ -121,11 +145,25 @@ def smoke(
         payload["text"] = _structured_text_format(schema or DEFAULT_STRUCTURED_SCHEMA)
     project_payload: dict[str, Any] | None = None
     support_bundle: dict[str, Any] | None = None
+    memory_seed: dict[str, Any] | None = None
     with runtime.client() as client:
         ready = client.public("GET", "/health/ready")
+        project_headers: dict[str, str] = {}
         if project:
             project_payload = resolve_project(client, project)
             headers["X-Project-ID"] = str(project_payload["id"])
+            project_headers["X-Project-ID"] = str(project_payload["id"])
+        if memory_recall_code is not None:
+            memory_seed = client.app(
+                "POST",
+                "/api/v1/agent/memory/store",
+                json=_memory_recall_seed_payload(
+                    user=user,
+                    recall_code=memory_recall_code,
+                    turn_id=turn_id,
+                ),
+                headers=project_headers,
+            )
         response = client.app("POST", "/v1/responses", json=payload, headers=headers)
         metadata_payload = response.get("metadata", {}) if isinstance(response, dict) else {}
         if include_support_bundle and project_payload is not None:
@@ -152,6 +190,13 @@ def smoke(
         metadata=metadata_payload,
         project=project_payload,
     )
+    memory_recall_evidence = _memory_recall_evidence(
+        enabled=memory_recall,
+        recall_code=memory_recall_code,
+        seed_response=memory_seed,
+        response=response,
+        prompt=message,
+    )
     dashboard_urls = _dashboard_evidence_urls(
         project=project_payload,
         trace_id=support_receipt.get("trace_id"),
@@ -164,20 +209,39 @@ def smoke(
         support_receipt=support_receipt,
         dashboard_urls=dashboard_urls,
         support_bundle=support_bundle,
+        memory_recall=memory_recall_evidence,
     )
+    # Gate on the actual response body, not just an HTTP 200: a 200 with an empty or
+    # wrong reply must fail so an agent that checks the exit code does not ship a
+    # broken agent.
     verdict = _smoke_verdict(
         ready=ready,
         response=response,
         structured=structured,
         expects_default_token=expects_default_token,
     )
+    smoke_failed = verdict["verdict"] != "PASS" or memory_recall_evidence.get("status") == "failed"
+    evidence_import: dict[str, Any] | None = None
+    if import_evidence and project_payload is not None:
+        with runtime.client() as client:
+            evidence_import = client.admin(
+                "POST",
+                (
+                    f"/projects/{encode_path_segment(str(project_payload['id']))}"
+                    "/launch-readiness/evidence"
+                ),
+                json={
+                    "artifact": smoke_evidence,
+                    "artifact_type": "smoke_evidence",
+                    "source": "cli",
+                    "artifact_path": str(evidence_output) if evidence_output else None,
+                },
+            )
     if evidence_output is not None:
         _write_evidence(evidence_output, smoke_evidence)
     if raw:
         print_json(
             {
-                "verdict": verdict["verdict"],
-                "verdict_detail": verdict["detail"],
                 "ready": ready,
                 "response": response,
                 "response_id": response.get("id") if isinstance(response, dict) else None,
@@ -193,11 +257,15 @@ def smoke(
                 ),
                 "support_receipt": support_receipt,
                 "dashboard_urls": dashboard_urls,
+                "memory_recall": memory_recall_evidence,
+                "evidence_import": evidence_import,
                 "evidence": smoke_evidence,
+                "verdict": verdict["verdict"],
+                "verdict_detail": verdict["detail"],
             }
         )
-        if verdict["verdict"] != "PASS":
-            raise CLIError(verdict["detail"])
+        if smoke_failed:
+            raise typer.Exit(1)
         return
 
     rows: list[list[object]] = [["Ready", _status_text(ready)]]
@@ -207,6 +275,27 @@ def smoke(
                 ["Response ID", response.get("id", "")],
                 ["Status", response.get("status", "")],
                 ["Model", response.get("model", metadata_payload.get("general_augment_model", ""))],
+                [
+                    "Latency",
+                    _display_metric(
+                        _metadata_value(metadata_payload, "general_augment_latency_ms"),
+                        suffix=" ms",
+                    ),
+                ],
+                [
+                    "Tokens",
+                    _token_summary(response=response, metadata=metadata_payload),
+                ],
+                [
+                    "Cost",
+                    _display_metric(
+                        _metadata_value(
+                            metadata_payload,
+                            "general_augment_cost_usd",
+                            "cost_usd",
+                        )
+                    ),
+                ],
                 [
                     "Request ID",
                     metadata_payload.get(
@@ -225,10 +314,14 @@ def smoke(
         )
         if structured:
             rows.append(["Output Format", "json_schema"])
+        if memory_recall_evidence.get("enabled"):
+            rows.append(["Memory Recall", memory_recall_evidence.get("status", "unknown")])
         if dashboard_urls.get("observability_url"):
             rows.append(["Dashboard", dashboard_urls["observability_url"]])
         if evidence_output is not None:
             rows.append(["Evidence", evidence_output])
+        if evidence_import is not None:
+            rows.append(["Evidence Import", evidence_import.get("audit_event_id", "retained")])
     rows.append(["Verdict", verdict["verdict"]])
     table("Smoke", ["Check", "Value"], rows)
     if isinstance(response, dict):
@@ -236,7 +329,7 @@ def smoke(
         panel("Support receipt", json.dumps(support_receipt, indent=2, sort_keys=True))
     if evidence_output is not None:
         print_success(f"Wrote smoke evidence to {evidence_output}.")
-    if verdict["verdict"] != "PASS":
+    if smoke_failed:
         raise CLIError(verdict["detail"])
     print_success("Smoke passed: the agent returned the expected response.")
 
@@ -304,13 +397,6 @@ def _structured_text_format(schema: dict[str, Any]) -> dict[str, Any]:
             "strict": True,
         }
     }
-
-
-def _status_text(payload: object) -> str:
-    """Return a compact status string from health JSON."""
-    if isinstance(payload, dict):
-        return str(payload.get("status") or payload)
-    return str(payload)
 
 
 def _smoke_verdict(
@@ -382,6 +468,13 @@ def _health_ok(payload: object) -> bool:
     return str(payload.get("status") or "").lower() in {"ok", "ready", "healthy", "pass"}
 
 
+def _status_text(payload: object) -> str:
+    """Return a compact status string from health JSON."""
+    if isinstance(payload, dict):
+        return str(payload.get("status") or payload)
+    return str(payload)
+
+
 def _response_output_text(response: dict[str, Any]) -> str:
     """Extract text from the common Responses output shape."""
     output_text = response.get("output_text")
@@ -410,9 +503,57 @@ def _metadata_value(metadata: object, *keys: str) -> object:
         return None
     for key in keys:
         value = metadata.get(key)
-        if value:
+        if value is not None and value != "":
             return value
     return None
+
+
+def _usage_value(
+    response: dict[str, Any],
+    metadata: object,
+    usage_key: str,
+    metadata_key: str,
+) -> object:
+    """Return a usage value from the Responses usage object or metadata fallback."""
+    usage = response.get("usage")
+    if isinstance(usage, dict):
+        value = usage.get(usage_key)
+        if value is not None and value != "":
+            return value
+    return _metadata_value(metadata, metadata_key)
+
+
+def _token_summary(*, response: dict[str, Any], metadata: object) -> str:
+    """Return a compact token summary for CLI smoke output."""
+    input_tokens = _usage_value(
+        response,
+        metadata,
+        "input_tokens",
+        "general_augment_input_tokens",
+    )
+    output_tokens = _usage_value(
+        response,
+        metadata,
+        "output_tokens",
+        "general_augment_output_tokens",
+    )
+    total_tokens = _usage_value(response, metadata, "total_tokens", "general_augment_total_tokens")
+    if (
+        total_tokens is None
+        and isinstance(input_tokens, (int, float))
+        and isinstance(output_tokens, (int, float))
+    ):
+        total_tokens = input_tokens + output_tokens
+    if total_tokens is None:
+        return "n/a"
+    return f"{total_tokens} total ({input_tokens or 0} input, {output_tokens or 0} output)"
+
+
+def _display_metric(value: object, *, suffix: str = "") -> str:
+    """Return a display-safe metric value."""
+    if value is None or value == "":
+        return "n/a"
+    return f"{value}{suffix}"
 
 
 def _support_receipt(
@@ -443,9 +584,86 @@ def _support_receipt(
             "trace_id",
         ),
         "model": model,
+        "status": response_payload.get("status"),
+        "latency_ms": _metadata_value(metadata, "general_augment_latency_ms"),
+        "input_tokens": _usage_value(
+            response_payload,
+            metadata,
+            "input_tokens",
+            "general_augment_input_tokens",
+        ),
+        "output_tokens": _usage_value(
+            response_payload,
+            metadata,
+            "output_tokens",
+            "general_augment_output_tokens",
+        ),
+        "total_tokens": _usage_value(
+            response_payload,
+            metadata,
+            "total_tokens",
+            "general_augment_total_tokens",
+        ),
         "cost_usd": _metadata_value(metadata, "general_augment_cost_usd", "cost_usd"),
         "ready_status": _status_text(ready),
+        "next_action": (
+            "Open the response in dashboard observability, then verify trace and "
+            "memory evidence before production traffic."
+        ),
     }
+
+
+def _memory_recall_seed_payload(
+    *,
+    user: str,
+    recall_code: str,
+    turn_id: str,
+) -> dict[str, object]:
+    """Build a one-time memory fact for runtime recall smoke proof."""
+
+    return {
+        "user_id": user,
+        "fact": f"The user's General Augment smoke recall code is {recall_code}.",
+        "fact_type": "fact",
+        "importance_score": 1.0,
+        "source": "genaug-cli-smoke-memory",
+        "idempotency_key": f"genaug-smoke-memory-{turn_id}",
+        "metadata": {"source": "genaug-cli-smoke", "probe": "memory_recall"},
+    }
+
+
+def _memory_recall_evidence(
+    *,
+    enabled: bool,
+    recall_code: str | None,
+    seed_response: object,
+    response: object,
+    prompt: str,
+) -> dict[str, object]:
+    """Return bounded evidence for the optional memory-through-runtime smoke probe."""
+
+    if not enabled:
+        return {"enabled": False}
+    response_text = _response_output_text(response) if isinstance(response, dict) else ""
+    seed_payload = seed_response if isinstance(seed_response, dict) else {}
+    expected_present = bool(recall_code and recall_code in response_text)
+    prompt_included_expected = bool(recall_code and recall_code in prompt)
+    return {
+        "enabled": True,
+        "status": "passed" if expected_present and not prompt_included_expected else "failed",
+        "seed_memory_id": seed_payload.get("memory_id") or seed_payload.get("id"),
+        "seed_status": seed_payload.get("status"),
+        "expected_code_sha256": _sha256(recall_code or ""),
+        "expected_present_in_response": expected_present,
+        "prompt_included_expected_code": prompt_included_expected,
+        "response_text_length": len(response_text),
+    }
+
+
+def _sha256(value: str) -> str:
+    """Return a deterministic non-secret digest."""
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _dashboard_evidence_urls(
@@ -485,6 +703,7 @@ def _smoke_evidence(
     support_receipt: dict[str, object],
     dashboard_urls: dict[str, str | None],
     support_bundle: dict[str, Any] | None,
+    memory_recall: dict[str, object],
 ) -> dict[str, object]:
     """Create the redacted smoke evidence artifact."""
     response_payload = response if isinstance(response, dict) else {}
@@ -499,7 +718,8 @@ def _smoke_evidence(
         },
         "support_receipt": support_receipt,
         "dashboard_urls": dashboard_urls,
-        "support_bundle": support_bundle,
+        "support_bundle": redact_metadata(support_bundle) if support_bundle is not None else None,
+        "memory_recall": memory_recall,
         "security": {
             "raw_secrets_included": False,
             "raw_provider_credentials_included": False,

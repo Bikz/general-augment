@@ -42,6 +42,8 @@ class MemoryFact:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = MOCK_CREATED_AT
     expires_at: str | None = None
+    status: str = "active"
+    supersedes_memory_id: str | None = None
 
     def as_result(self, score: float | None) -> dict[str, Any]:
         """Return a public memory-hit shape."""
@@ -57,7 +59,9 @@ class MemoryFact:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "source": self.source,
+            "status": self.status,
             "metadata": self.metadata,
+            "supersedes_memory_id": self.supersedes_memory_id,
         }
 
 
@@ -599,6 +603,63 @@ class LocalGAMockStore:
             "total_facts": len(facts),
         }
 
+    def memory_lineage(self, memory_id: str, user_id: str) -> tuple[int, dict[str, Any]]:
+        """Return a bounded mock lineage for one memory fact."""
+        facts = [
+            fact
+            for fact in self.memories.get(user_id, [])
+            if fact.memory_id == memory_id or fact.supersedes_memory_id == memory_id
+        ]
+        if not facts:
+            return HTTPStatus.NOT_FOUND, _error("memory_not_found", "No scoped memory fact found.")
+        return HTTPStatus.OK, {
+            "user_id": user_id,
+            "general_augment_user_id": _mock_user_uuid(user_id),
+            "memory_id": memory_id,
+            "facts": [fact.as_result(None) for fact in facts],
+            "related_count": len(facts),
+        }
+
+    def correct_memory(self, memory_id: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Correct one active mock memory fact by appending a replacement."""
+        user_id = _external_user_id(payload)
+        fact = str(payload.get("fact") or payload.get("content") or "").strip()
+        if not fact:
+            return HTTPStatus.BAD_REQUEST, _error("invalid_memory", "fact is required.")
+        facts = self.memories.get(user_id, [])
+        existing = next(
+            (item for item in facts if item.memory_id == memory_id and item.status == "active"),
+            None,
+        )
+        if existing is None:
+            return HTTPStatus.NOT_FOUND, _error("memory_not_found", "No active memory fact found.")
+        existing.status = "superseded"
+        corrected_id = f"mem_mock_{_digest_json({'user_id': user_id, 'correction': fact})[:16]}"
+        metadata = _object_payload(payload.get("metadata"))
+        corrected = MemoryFact(
+            memory_id=corrected_id,
+            user_id=user_id,
+            fact=fact,
+            fact_type=str(payload.get("fact_type") or existing.fact_type),
+            importance_score=_optional_float(payload.get("importance_score"))
+            if payload.get("importance_score") is not None
+            else existing.importance_score,
+            source=_optional_string(payload.get("source")) or existing.source,
+            metadata=dict(metadata or existing.metadata),
+            supersedes_memory_id=memory_id,
+        )
+        facts.append(corrected)
+        return HTTPStatus.OK, {
+            "user_id": user_id,
+            "general_augment_user_id": _mock_user_uuid(user_id),
+            "memory_id": memory_id,
+            "corrected_memory_id": corrected_id,
+            "content": fact,
+            "source": corrected.source,
+            "metadata": corrected.metadata,
+            "status": "corrected",
+        }
+
     def delete_memory(self, memory_id: str, user_id: str) -> tuple[int, dict[str, Any]]:
         """Delete one memory for the scoped app user."""
         facts = self.memories.get(user_id, [])
@@ -853,6 +914,13 @@ class LocalGAMockHandler(BaseHTTPRequestHandler):
             status, payload = self.store.memory_profile(user_id)
             self._send_json(status, payload)
             return
+        if parsed.path.startswith("/api/v1/agent/memory/lineage/"):
+            memory_id = _path_suffix(parsed.path, "/api/v1/agent/memory/lineage/")
+            query = parse_qs(parsed.query)
+            user_id = query.get("user_id", [""])[0]
+            status, payload = self.store.memory_lineage(memory_id, user_id)
+            self._send_json(status, payload)
+            return
         self._send_json(HTTPStatus.NOT_FOUND, _error("not_found", "No mock route matched."))
 
     def do_POST(self) -> None:
@@ -891,6 +959,13 @@ class LocalGAMockHandler(BaseHTTPRequestHandler):
                 status, response = self.store.add_project_skill(project_id, payload)
                 self._send_json(status, response)
                 return
+        if parsed.path.startswith("/api/v1/agent/memory/") and parsed.path.endswith("/correct"):
+            memory_id = _path_suffix(parsed.path, "/api/v1/agent/memory/").removesuffix(
+                "/correct"
+            )
+            status, response = self.store.correct_memory(memory_id, payload)
+            self._send_json(status, response)
+            return
         if parsed.path == "/api/v1/agent/memory/store":
             status, response = self.store.store_memory(payload)
             self._send_json(status, response)

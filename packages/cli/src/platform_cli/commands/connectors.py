@@ -103,7 +103,7 @@ def setup_connectors(
         ["Connector", "Setup", "Health"],
         [
             [item["connector"], item["setup_command"], item["health_command"]]
-            for item in payload["connectors"]
+            for item in recipes
         ],
     )
 

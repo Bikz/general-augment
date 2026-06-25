@@ -13,8 +13,9 @@ pip install general-augment-cli
 genaug --help
 ```
 
-Use `genaug` for project setup, OpenAPI tool registration, provider-key health checks,
-smoke tests, support receipts, memory checks, and onboarding verification.
+Use `genaug` for project setup and migration, OpenAPI tool registration, provider-key
+health checks, connector and skill configuration, smoke tests, and `verify` acceptance
+checks.
 
 ## Python SDK
 
@@ -35,9 +36,14 @@ Use from trusted Node.js backend code. Keep API keys out of browser and mobile b
 
 ## Local Development
 
+The deterministic local HTTP mock ships with the CLI package and is launched as a Python
+module (it is not a `genaug` subcommand):
+
 ```bash
-genaug mock --host 127.0.0.1 --port 8787 --quiet
+uv run --project packages/cli python -m platform_cli.local_mock \
+  --host 127.0.0.1 --port 8787 --quiet
 ```
 
 The local mock supports deterministic Responses, memory, usage, logs, trace metadata,
-and project setup routes for app CI.
+and project setup routes for app CI. Point the SDKs at it with
+`GENAUG_API_BASE_URL=http://127.0.0.1:8787`.

@@ -1,6 +1,7 @@
 # General Augment Python SDK
 
-Backend SDK for General Augment app integrations. Use it from trusted server code.
+General Augment is the agent backend for your app. This is the backend SDK for General
+Augment app integrations. Use it from trusted server code.
 Project-scoped keys are for app traffic such as Responses and memory calls. Admin and
 setup helpers require a management/admin-capable key and send it as `X-Admin-Key`.
 
@@ -136,7 +137,8 @@ body. Existing code that only reads `status_code` or `detail` keeps working.
 Run the local mock server and point the SDK at it:
 
 ```bash
-uv run --project packages/cli genaug mock --host 127.0.0.1 --port 8787 --quiet
+uv run --project packages/cli python -m platform_cli.local_mock \
+  --host 127.0.0.1 --port 8787 --quiet
 export GENAUG_API_BASE_URL="http://127.0.0.1:8787"
 export GENAUG_API_KEY="local-test"
 PYTHONPATH=src python examples/contract_test.py

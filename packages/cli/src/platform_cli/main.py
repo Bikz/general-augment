@@ -10,35 +10,18 @@ import typer
 from platform_cli import __version__
 from platform_cli.branding import get_branding
 from platform_cli.commands import (
-    approvals,
     auth,
-    billing,
-    channels,
     connectors,
     dashboard,
-    evals,
-    identity,
-    jobs,
     keys,
-    mcp,
-    memory,
     migrate,
-    model_providers,
-    observability,
-    onboarding,
-    projects,
     providers,
     skills,
     tools,
-    users,
 )
-from platform_cli.commands.deploy import deploy
-from platform_cli.commands.dev import dev
 from platform_cli.commands.doctor import doctor
 from platform_cli.commands.init import init
 from platform_cli.commands.integrate import integrate
-from platform_cli.commands.logs import logs
-from platform_cli.commands.mock import mock
 from platform_cli.commands.setup import setup
 from platform_cli.commands.smoke import smoke
 from platform_cli.commands.status import status
@@ -55,23 +38,10 @@ app = typer.Typer(
     no_args_is_help=True,
     invoke_without_command=True,
 )
-app.add_typer(approvals.app, name="approvals")
 app.add_typer(auth.app, name="auth")
-app.add_typer(billing.app, name="billing")
-app.add_typer(projects.app, name="projects")
 app.add_typer(keys.app, name="keys")
 app.add_typer(tools.app, name="tools")
 app.add_typer(skills.app, name="skills")
-app.add_typer(mcp.app, name="mcp")
-app.add_typer(model_providers.app, name="model-providers")
-app.add_typer(memory.app, name="memory")
-app.add_typer(users.app, name="users")
-app.add_typer(identity.app, name="identity")
-app.add_typer(jobs.app, name="jobs")
-app.add_typer(observability.app, name="observability")
-app.add_typer(channels.app, name="channels")
-app.add_typer(onboarding.app, name="onboarding")
-app.add_typer(evals.app, name="evals")
 app.add_typer(providers.app, name="providers")
 app.add_typer(connectors.app, name="connectors")
 app.add_typer(migrate.app, name="migrate")
@@ -79,11 +49,7 @@ app.add_typer(dashboard.app, name="dashboard")
 app.command("integrate")(integrate)
 app.command("init")(init)
 app.command("setup")(setup)
-app.command("deploy")(deploy)
-app.command("dev")(dev)
 app.command("doctor")(doctor)
-app.command("mock")(mock)
-app.command("logs")(logs)
 app.command("status")(status)
 app.command("smoke")(smoke)
 app.command("validate")(validate)

@@ -8,7 +8,7 @@ from typing import Annotated
 import typer
 
 from platform_cli.client import encode_path_segment
-from platform_cli.openapi import scaffold_from_openapi
+from platform_cli.openapi import ScaffoldResult, scaffold_from_openapi
 from platform_cli.output import print_json, print_success, print_warning, table
 from platform_cli.runtime import Runtime
 
@@ -76,7 +76,7 @@ def integrate(
 
     registration: dict[str, object] | None = None
     if auto_deploy:
-        from platform_cli.commands.deploy import deploy_path
+        from platform_cli.deploy_helpers import deploy_path
 
         project = deploy_path(runtime, result.config_path, project_ref=None, quiet=json_output)
         project_id = project.get("id")
@@ -113,7 +113,7 @@ def integrate(
 
 
 def _integrate_json(
-    result: object,
+    result: ScaffoldResult,
     tool_summaries: list[dict[str, object]],
     deployed: bool,
     project: dict[str, object] | None,

@@ -88,9 +88,16 @@ def _joined(items: list[str]) -> str:
     return ", ".join(items) if items else "none"
 
 
-def _tool_discovery_summary(value: dict[str, int | str]) -> str:
+def _tool_discovery_summary(value: dict[str, object]) -> str:
     """Return compact display text for tool discovery behavior."""
+    approval_policy = value.get("approval_policy")
+    approval_mode = (
+        approval_policy.get("mode")
+        if isinstance(approval_policy, dict)
+        else "tool_defaults"
+    )
     return (
         f"{value['mode']} "
-        f"(direct <= {value['direct_schema_tool_limit']}, search <= {value['max_search_results']})"
+        f"(direct <= {value['direct_schema_tool_limit']}, "
+        f"search <= {value['max_search_results']}, approval={approval_mode})"
     )

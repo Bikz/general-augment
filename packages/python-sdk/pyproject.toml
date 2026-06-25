@@ -4,15 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "general-augment-sdk"
-version = "0.1.0"
-description = "Python SDK for the General Augment admin and integration APIs."
+version = "0.2.0"
+description = "Python SDK for General Augment, the agent backend for your app."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "General Augment" }]
+keywords = ["general-augment", "agent-backend", "ai-agents", "llm", "memory", "tools"]
 dependencies = [
     "httpx>=0.28.0",
     "pyyaml>=6.0.0",
+    # Required by the Fern-generated typed models in genaug._generated / genaug.types.
+    "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -21,8 +24,24 @@ dev = [
 ]
 
 [project.urls]
+Homepage = "https://generalaugment.com"
 Documentation = "https://docs.generalaugment.com"
-Source = "https://github.com/Bikz/general-augment"
+Source = "https://github.com/LunarVentures/general-augment-platform"
+Issues = "https://github.com/LunarVentures/general-augment-platform/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/genaug"]
+
+# The generated subpackage (src/genaug/_generated) and the PEP 561 marker are gitignored
+# regenerable output, so hatchling would exclude them from the wheel by default. Force
+# them in so `import genaug` works from a clean install.
+[tool.hatch.build]
+artifacts = [
+    "src/genaug/_generated/**/*.py",
+    "src/genaug/py.typed",
+]
+
+[tool.pytest.ini_options]
+# Only the hand-written facade test suite. Excludes examples/ and the Fern-generated
+# _generated/tests/ (transport tests we do not consume).
+testpaths = ["tests"]

@@ -18,9 +18,7 @@ integration is ready.
 - [ ] Idempotency keys are used for retryable turns.
 - [ ] Tool actions are allowlisted and risky actions require approval.
 - [ ] Memory scope, retention, and deletion behavior are accepted.
-- [ ] External channel identity mapping is accepted if Telegram, WhatsApp, SMS, or other
-  channels are enabled.
-- [ ] Traces, logs, usage, and support bundles are available to debug incidents.
+- [ ] Traces, logs, usage, and support evidence are available to debug incidents.
 - [ ] Billing mechanism, included usage, provider-bill ownership, and support posture are
   explicit.
 - [ ] Regulated data, DPA/BAA, residency, retention, and SLA scope are explicit.
@@ -37,38 +35,36 @@ genaug connectors setup --name <connector-name> --url '<secret-safe-mcp-url>' --
 genaug skills design --job-type <job-type> --project <project-slug> --apply
 genaug smoke --project <project-slug> --evidence-output .genaug/smoke-evidence.json --json
 genaug verify --project <project-slug> --json
-genaug onboarding verify --project <project-slug> --json
 genaug dashboard open --project <project-slug>
 ```
 
 For tenant-owned provider capacity:
 
 ```bash
-genaug model-providers list --project <project-slug>
-genaug model-providers health <provider> --project <project-slug> --json
+genaug providers setup --provider <provider> --project <project-slug> --api-key-env <ENV_VAR> --health-check
+genaug providers smoke --provider <provider> --project <project-slug> --json
+genaug providers readiness --project <project-slug> --json
 ```
 
 For tools:
 
 ```bash
-genaug projects runtime-policy --project <project-slug> --json
 genaug tools list --project <project-slug>
 genaug tools discovery --project <project-slug> --json
 ```
 
-For memory:
+For memory (from backend code, using the SDK):
 
-```bash
-genaug memory profile --project <project-slug> --user <app-user-id>
-genaug memory search --project <project-slug> --user <app-user-id> --query "<known fact>"
+```python
+client.memory_profile("<app-user-id>")
+client.search_memory({"user_id": "<app-user-id>", "query": "<known fact>"})
 ```
 
-For observability:
+For observability, persist redacted launch evidence from `smoke`:
 
 ```bash
-genaug logs --project <project-slug>
-genaug observability trace <trace-id> --project <project-slug> --json
-genaug observability support-bundle --project <project-slug> --json
+genaug smoke --project <project-slug> --include-support-bundle \
+  --evidence-output .genaug/smoke-evidence.json --json
 ```
 
 ## Ready Output
@@ -80,7 +76,7 @@ Return `ready` only when the current app path has proof for:
 - first response;
 - smoke evidence artifact with dashboard observability URL;
 - provider attribution when tenant-owned model capacity is in scope;
-- memory/tool/channel/approval evidence for any enabled surface;
+- memory/tool evidence for any enabled surface;
 - trace or support-bundle evidence;
 - known limits and regulated-data scope.
 

@@ -7,7 +7,16 @@
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,
-    "target": "ES2022"
+    "target": "ES2022",
+    // The Fern-generated transport (src/_generated/core) uses fetch/streams, so it
+    // needs the DOM + DOM.Iterable libs (matches Fern's own tsconfig); the hardened
+    // facade's streamResponse also relies on ReadableStream/TextDecoder.
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    // The generated code touches Node globals (process, Buffer) behind runtime
+    // guards; @types/node provides the ambient types.
+    "types": ["node"],
+    // Single-sourced VERSION imports package.json under NodeNext.
+    "resolveJsonModule": true
   },
   "include": ["src/**/*.ts"]
 }

@@ -1,0 +1,80 @@
+{
+  "schema_version": "general-augment-readiness/v1",
+  "checks": [
+    {
+      "key": "api_ready",
+      "label": "API ready",
+      "description": "Hosted API readiness returned healthy dependencies."
+    },
+    {
+      "key": "project_created",
+      "label": "Project created",
+      "description": "The project exists and can be resolved by the CLI."
+    },
+    {
+      "key": "project_key_created",
+      "label": "Project key created",
+      "description": "At least one project-scoped server API key exists."
+    },
+    {
+      "key": "project_key_execution",
+      "label": "Project key execution",
+      "description": "The configured project key can call /v1/responses."
+    },
+    {
+      "key": "first_response_passed",
+      "label": "First response passed",
+      "description": "A hosted test turn completed successfully."
+    },
+    {
+      "key": "run_timeline_visible",
+      "label": "Run timeline visible",
+      "description": "The hosted test turn produced an inspectable durable run timeline."
+    },
+    {
+      "key": "tools_configured",
+      "label": "Tools configured",
+      "description": "The tool registry is reachable for this project."
+    },
+    {
+      "key": "runtime_policy_visible",
+      "label": "Runtime policy visible",
+      "description": "Project model routing and Hermes-facing policy are visible."
+    },
+    {
+      "key": "tenant_behavior_configured",
+      "label": "Agent behavior configured",
+      "description": "SOUL instructions or project skills make the agent behavior product-specific."
+    },
+    {
+      "key": "memory_tested",
+      "label": "Memory tested",
+      "description": "Memory store, search, profile, and delete checks passed."
+    },
+    {
+      "key": "memory_response_recall",
+      "label": "Memory response recall",
+      "description": "The normal /v1/responses path recalled a stored synthetic memory marker."
+    },
+    {
+      "key": "trace_visible",
+      "label": "Trace visible",
+      "description": "Observability returned trace rows for follow-up debugging."
+    },
+    {
+      "key": "usage_limits_visible",
+      "label": "Usage limits visible",
+      "description": "Usage totals and plan limits are visible."
+    },
+    {
+      "key": "channel_status_known",
+      "label": "Channel status known",
+      "description": "Channel readiness state is visible for the project."
+    },
+    {
+      "key": "billing_state_known",
+      "label": "Billing state known",
+      "description": "The project exposes a billing or plan state."
+    }
+  ]
+}

@@ -30,6 +30,7 @@ const stored = await client.storeMemory({
   user_id: "sdk-contract-user",
   fact: "User prefers window seats",
   fact_type: "preference",
+  collection_key: "travel_preferences",
   idempotency_key: "sdk-contract-memory-1",
 });
 assert.ok(stored.memory_id ?? stored.id);
@@ -38,6 +39,7 @@ const search = await client.searchMemory({
   user_id: "sdk-contract-user",
   query: "seat preference",
   limit: 3,
+  collection_key: "travel_preferences",
 });
 assert.ok(Array.isArray(search.facts));
 

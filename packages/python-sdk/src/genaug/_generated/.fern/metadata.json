@@ -1,0 +1,13 @@
+{
+  "cliVersion": "5.50.6",
+  "generatorName": "fernapi/fern-python-sdk",
+  "generatorVersion": "5.14.21",
+  "generatorConfig": {
+    "package_name": "general_augment",
+    "client_class_name": "GeneralAugmentClient",
+    "output_directory": "project-root"
+  },
+  "originGitCommit": "269013fd5a30ee73ff9442b594e804dca6004f79",
+  "originGitCommitIsDirty": true,
+  "invokedBy": "manual"
+}

@@ -13,6 +13,15 @@ export {
 } from "./client.js";
 export { linkUser, resolveUser, unlinkUser } from "./identity.js";
 export { registerFromOpenAPI } from "./tools.js";
+
+// Fern-generated typed request/response models for the curated public API,
+// re-exported under the `types` namespace as the drift-checked typed contract —
+// the TypeScript mirror of Python's `genaug.types`. The re-export is CURATED to
+// the same 24 public models Python exposes (see src/types-generated.ts). Import
+// from `types` when you want the statically-typed request/response shapes; the
+// hand-written GeneralAugmentClient keeps its own hardened fetch transport and
+// JsonObject-based payloads for backwards compatibility.
+export * as types from "./types-generated.js";
 export type {
   AgentTestResponse,
   APIErrorDetail,

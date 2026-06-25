@@ -14,7 +14,6 @@ from platform_cli.errors import CLIError
 from platform_cli.output import panel, print_json, table
 from platform_cli.readiness import build_readiness_checklist
 from platform_cli.runtime import Runtime
-from platform_cli.self_serve import dashboard_project_url
 
 
 def verify(
@@ -159,6 +158,7 @@ def build_project_verification_payload(
             or str(agent_test.get("response_text") or agent_test.get("response") or ""),
         )
     )
+    checks.append(_run_timeline_check(client, project_id=project_id, agent_test=agent_test))
 
     logs = client.admin(
         "GET",
@@ -334,6 +334,40 @@ def _project_key_execution_check(
         "project_key_execution",
         passed,
         response_id or text or status or "missing response id",
+    )
+
+
+def _run_timeline_check(
+    client: Any,
+    *,
+    project_id: str,
+    agent_test: object,
+) -> dict[str, str]:
+    """Inspect the durable run produced by the dashboard/admin test turn."""
+    if not isinstance(agent_test, dict):
+        return _check("run_timeline_inspect", False, "agent test response was not an object")
+    metadata = agent_test.get("metadata")
+    if not isinstance(metadata, dict):
+        return _check("run_timeline_inspect", False, "agent test metadata missing")
+    run_id = str(metadata.get("agent_run_id") or "").strip()
+    if not run_id:
+        return _check("run_timeline_inspect", False, "agent test did not return agent_run_id")
+    try:
+        run = client.admin(
+            "GET",
+            f"/projects/{encode_path_segment(project_id)}/runs/{encode_path_segment(run_id)}",
+        )
+    except CLIError as exc:
+        return _check("run_timeline_inspect", False, str(exc))
+    if not isinstance(run, dict):
+        return _check("run_timeline_inspect", False, f"run {run_id} response was not an object")
+    events = run.get("run_events")
+    status = str(run.get("status") or "unknown")
+    event_count = len(events) if isinstance(events, list) else 0
+    return _check(
+        "run_timeline_inspect",
+        bool(run.get("id")) and isinstance(events, list) and event_count > 0,
+        f"run_id={run.get('id') or run_id}, status={status}, events={event_count}",
     )
 
 
@@ -544,10 +578,9 @@ def _runtime_policy_artifact(payload: object) -> dict[str, Any]:
 def _dashboard_links(dashboard_url: str, project_id: str) -> dict[str, str]:
     """Build dashboard URLs for UI follow-up checks."""
 
-    project_root = dashboard_project_url(
-        encode_path_segment(project_id),
-        base_url=dashboard_url.rstrip("/"),
-    )
+    base = dashboard_url.rstrip("/")
+    encoded = encode_path_segment(project_id)
+    project_root = f"{base}/dashboard/projects/{encoded}"
     return {
         "project": project_root,
         "integrate": f"{project_root}/integrate",
@@ -567,7 +600,11 @@ def _run_memory_lifecycle(
     """Store, search, profile, and delete one synthetic memory fact."""
 
     headers = {"X-Project-ID": project_id}
-    fact = "CLI verification user prefers concise onboarding notes."
+    recall_marker = f"genaug-memory-verify-{verification_id}"
+    fact = (
+        "CLI verification user prefers concise onboarding notes. "
+        f"The user's private verification marker is {recall_marker}."
+    )
     checks: list[dict[str, str]] = []
 
     stored = client.app(
@@ -614,6 +651,16 @@ def _run_memory_lifecycle(
     checks.append(
         _check("memory_profile", isinstance(total_facts, int), f"total_facts={total_facts}")
     )
+    checks.append(
+        _run_memory_response_recall(
+            client,
+            project_id=project_id,
+            user=user,
+            recall_marker=recall_marker,
+        )
+        if memory_id
+        else _skip("memory_response_recall", "skipped because memory_store failed")
+    )
 
     if memory_id:
         deleted = client.app(
@@ -633,6 +680,48 @@ def _run_memory_lifecycle(
     else:
         checks.append(_check("memory_delete", False, "skipped because memory_store failed"))
     return checks
+
+
+def _run_memory_response_recall(
+    client: Any,
+    *,
+    project_id: str,
+    user: str,
+    recall_marker: str,
+) -> dict[str, str]:
+    """Ask the normal responses path to recall the synthetic memory marker."""
+
+    try:
+        response = client.app(
+            "POST",
+            "/v1/responses",
+            json={
+                "model": "balanced",
+                "user": user,
+                "input": (
+                    "What is my stored CLI verification memory marker? "
+                    "Reply with only the marker."
+                ),
+                "metadata": {
+                    "source": "genaug-cli-verify",
+                    "feature": "memory_response_recall",
+                },
+            },
+            headers={"X-Project-ID": project_id},
+        )
+    except CLIError as exc:
+        return _check("memory_response_recall", False, str(exc))
+    if not isinstance(response, dict):
+        return _check("memory_response_recall", False, str(response))
+    response_id = str(response.get("id") or "")
+    status = str(response.get("status") or "")
+    text = _response_text(response)
+    if recall_marker.lower() in text.lower():
+        return _check("memory_response_recall", True, response_id or "marker recalled")
+    return _skip(
+        "memory_response_recall",
+        response_id or status or "response completed but marker was not found",
+    )
 
 
 def _memory_hit_found(facts: object, memory_id: str) -> bool:

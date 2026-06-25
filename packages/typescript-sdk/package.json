@@ -1,20 +1,41 @@
 {
   "name": "@general-augment/sdk",
-  "version": "0.1.0",
-  "description": "TypeScript SDK for the General Augment admin and integration APIs.",
+  "version": "0.2.0",
+  "description": "TypeScript SDK for General Augment, the agent backend for your app.",
   "type": "module",
   "engines": {
-    "node": ">=22 <25"
+    "node": ">=22 <26"
   },
+  "homepage": "https://generalaugment.com",
+  "keywords": [
+    "general-augment",
+    "agent-backend",
+    "ai-agents",
+    "llm",
+    "memory",
+    "tools"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Bikz/general-augment.git",
+    "url": "git+https://github.com/LunarVentures/general-augment-platform.git",
     "directory": "packages/typescript-sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/LunarVentures/general-augment-platform/issues"
   },
   "files": [
     "dist",
+    "src/_generated",
     "README.md"
   ],
   "publishConfig": {
@@ -27,6 +48,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "knip": "^6.6.1",
     "typescript": "^5.5.0"
   },

@@ -18,8 +18,8 @@ import random
 import time
 import uuid
 from collections.abc import Iterator, Mapping
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -816,8 +816,8 @@ def _parse_retry_after(value: str | None) -> float | None:
     if when is None:
         return None
     if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    delta = (when - datetime.now(timezone.utc)).total_seconds()
+        when = when.replace(tzinfo=UTC)
+    delta = (when - datetime.now(UTC)).total_seconds()
     return max(delta, 0.0)
 
 

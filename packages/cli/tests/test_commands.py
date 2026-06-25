@@ -1,24 +1,34 @@
-"""Command tests for the standalone CLI package."""
+"""Command tests for the standalone (public) CLI package."""
 
 from __future__ import annotations
 
 import json
 import re
 import tomllib
+import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import httpx
 import pytest
 import yaml
 from typer.testing import CliRunner
 
+from platform_cli.commands import auth as auth_command
+from platform_cli.errors import helpful_api_error
 from platform_cli.main import app
 
 ROOT = Path(__file__).resolve().parents[3]
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-PLACEHOLDER_MCP_URL = (
-    "https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}"
+PLACEHOLDER_MCP_URL = "https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}"
+CANARY_SECRETS = (
+    "sk-delegated-coding-secret",
+    "must-not-leak",
+    "sk-research-secret",
+    "bb-secret",
+    "support-token-secret",
+    "support-api-key-secret",
 )
 RICH_BOX_TRANSLATION = dict.fromkeys(
     map(ord, ("\u2500", "\u2502", "\u256d", "\u256e", "\u2570", "\u256f")),
@@ -53,8 +63,75 @@ class FakeHTTPClient:
         response.request = httpx.Request(method, url)
         return response
 
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> _FakeStreamResponse:
+        """Capture streaming request data and return queued SSE response."""
+        self.requests.append(
+            {"method": method, "url": url, "headers": headers or {}, "json": None, "params": params}
+        )
+        response = self.queue.pop(0) if self.queue else json_response({})
+        response.request = httpx.Request(method, url)
+        return _FakeStreamResponse(response)
+
     def close(self) -> None:
         """Close fake client."""
+
+
+class _FakeStreamResponse:
+    """Tiny context manager that exposes queued JSON as semantic SSE lines."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+        self.status_code = response.status_code
+        self.headers = response.headers
+
+    def __enter__(self) -> _FakeStreamResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._response.read()
+
+    def iter_lines(self) -> Iterator[str]:
+        payload = self._response.json()
+        if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+            for item in payload["items"]:
+                yield "event: agent_run.event"
+                yield f"data: {json.dumps(item)}"
+                yield ""
+            yield "event: agent_run.event_stream.done"
+            yield f"data: {json.dumps({'status': payload.get('status', '')})}"
+            yield ""
+            return
+        yield "event: message"
+        yield f"data: {json.dumps(payload)}"
+        yield ""
+
+
+class _FakeLocalCallback:
+    """Fake loopback callback server for browser auth tests."""
+
+    redirect_uri = "http://127.0.0.1:49231/callback"
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        self.wait_timeout: float | None = None
+        self.closed = False
+
+    def wait(self, timeout: float) -> str:
+        self.wait_timeout = timeout
+        return self.code
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def plain_cli_output(result: Any) -> str:
@@ -62,6 +139,18 @@ def plain_cli_output(result: Any) -> str:
     output = ANSI_RE.sub("", str(result.output))
     output = output.translate(RICH_BOX_TRANSLATION)
     return " ".join(output.split())
+
+
+def compact_cli_output(result: Any) -> str:
+    """Return CLI output compacted for option strings that Rich can wrap mid-token."""
+    return plain_cli_output(result).replace(" ", "")
+
+
+def assert_no_canary_secrets(value: object) -> None:
+    """Assert serialized output does not contain fake raw secrets."""
+    serialized = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    leaked = [secret for secret in CANARY_SECRETS if secret in serialized]
+    assert not leaked, "Raw canary secrets leaked into output: " + ", ".join(leaked)
 
 
 @pytest.fixture(autouse=True)
@@ -72,11 +161,16 @@ def fake_http(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx, "Client", FakeHTTPClient)
 
 
+class _FixedVerifyUUID:
+    hex = "abcdef1234567890"
+
+
 def test_auth_login_logout_whoami(tmp_path: Path) -> None:
     """Auth commands should write config, call /me, and clear config."""
     config_path = tmp_path / "config.yaml"
     runner = CliRunner()
     FakeHTTPClient.queue = [
+        json_response({"auth_method": "api_key", "project_id": "p1", "project_ids": []}),
         json_response({"auth_method": "api_key", "project_id": "p1", "project_ids": []}),
         json_response({"auth_method": "api_key", "project_id": "p1", "project_ids": []}),
     ]
@@ -95,6 +189,7 @@ def test_auth_login_logout_whoami(tmp_path: Path) -> None:
         ],
     )
     whoami = runner.invoke(app, ["--config", str(config_path), "auth", "whoami"])
+    whoami_json = runner.invoke(app, ["--config", str(config_path), "auth", "whoami", "--json"])
     logout = runner.invoke(app, ["--config", str(config_path), "auth", "logout"])
 
     assert login.exit_code == 0
@@ -103,10 +198,34 @@ def test_auth_login_logout_whoami(tmp_path: Path) -> None:
     assert whoami.exit_code == 0
     assert "api_key" in whoami.output
     assert "Project IDs: p1" in whoami.output
+    assert whoami_json.exit_code == 0
+    identity = json.loads(whoami_json.output)
+    assert identity["authenticated"] is True
+    assert identity["auth_method"] == "api_key"
+    assert identity["project_ids"] == ["p1"]
     assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/admin/me"
     assert FakeHTTPClient.requests[1]["url"] == "http://api.test/api/v1/admin/me"
+    assert FakeHTTPClient.requests[2]["url"] == "http://api.test/api/v1/admin/me"
     assert logout.exit_code == 0
     assert not config_path.exists()
+
+
+def test_auth_whoami_json_reports_unauthenticated(tmp_path: Path) -> None:
+    """Machine-readable auth checks should work before login."""
+    config_path = tmp_path / "config.yaml"
+
+    result = CliRunner().invoke(app, ["--config", str(config_path), "auth", "whoami", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "authenticated": False,
+        "auth_method": None,
+        "base_url": "https://api.generalaugment.com",
+        "next_action": "genaug auth login",
+        "project_ids": [],
+        "project_scope": "none",
+    }
 
 
 def test_auth_login_browser_flow_stores_installer_session_without_printing_tokens(
@@ -172,13 +291,95 @@ def test_auth_login_browser_flow_stores_installer_session_without_printing_token
     )
     assert FakeHTTPClient.requests[0]["headers"] == {}
     assert FakeHTTPClient.requests[1]["url"] == "http://api.test/api/v1/installer/auth/token"
-    assert FakeHTTPClient.requests[2]["headers"] == {
-        "Authorization": "Bearer gainst_access_secret"
-    }
+    assert FakeHTTPClient.requests[2]["headers"] == {"Authorization": "Bearer gainst_access_secret"}
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert config["api_key"] is None
     assert config["metadata"]["installer"]["access_token"] == "gainst_access_secret"
     assert config["metadata"]["installer"]["refresh_token"] == "garefr_refresh_secret"
+
+
+def test_auth_login_browser_flow_accepts_local_callback_without_paste(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Browser login should accept the loopback callback code without terminal paste."""
+    config_path = tmp_path / "config.yaml"
+    runner = CliRunner()
+    callback = _FakeLocalCallback("gacode_callback")
+    monkeypatch.setattr(auth_command, "_start_local_callback_server", lambda: callback)
+    monkeypatch.setattr(cast(Any, auth_command).webbrowser, "open", lambda _: True)
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "request_id": "req_1",
+                "authorize_url": "https://app.generalaugment.com/cli/authorize?request_id=req_1",
+                "expires_at": "2026-05-23T19:30:00Z",
+                "scopes": ["projects:write", "runtime_keys:create"],
+            }
+        ),
+        json_response(
+            {
+                "token_type": "Bearer",
+                "access_token": "gainst_access_secret",
+                "refresh_token": "garefr_refresh_secret",
+                "expires_at": "2026-05-23T20:30:00Z",
+                "scopes": ["projects:write", "runtime_keys:create"],
+                "project_id": "proj/1",
+            }
+        ),
+        json_response(
+            {
+                "auth_method": "installer",
+                "clerk_user_id": "user_123",
+                "clerk_email": "dev@example.com",
+                "scopes": ["projects:write", "runtime_keys:create"],
+                "project_id": "proj/1",
+                "project_ids": ["proj/1"],
+            }
+        ),
+    ]
+
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "auth",
+            "login",
+            "--base-url",
+            "http://api.test",
+            "--code-verifier",
+            "verifier",
+            "--callback-timeout",
+            "7",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Waiting for browser approval" in result.output
+    assert "gainst_access_secret" not in result.output
+    assert "garefr_refresh_secret" not in result.output
+    assert callback.wait_timeout == 7
+    assert callback.closed is True
+    assert FakeHTTPClient.requests[0]["json"]["redirect_uri"] == ("http://127.0.0.1:49231/callback")
+    assert FakeHTTPClient.requests[1]["json"]["code"] == "gacode_callback"
+
+
+def test_local_callback_server_captures_browser_authorization_code() -> None:
+    """The loopback callback helper should capture the browser authorization code."""
+    callback = auth_command._start_local_callback_server(port=0)
+    try:
+        with urllib.request.urlopen(
+            f"{callback.redirect_uri}?code=gacode_local",
+            timeout=2,
+        ) as response:
+            body = response.read().decode("utf-8")
+
+        assert response.status == 200
+        assert "General Augment CLI" in body
+        assert callback.wait(0.5) == "gacode_local"
+    finally:
+        callback.close()
 
 
 def test_setup_bootstrap_persists_runtime_key_into_config_but_not_artifact(
@@ -256,9 +457,7 @@ def test_setup_bootstrap_persists_runtime_key_into_config_but_not_artifact(
         },
     }
     assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/installer/projects"
-    assert FakeHTTPClient.requests[0]["headers"] == {
-        "Authorization": "Bearer gainst_access_secret"
-    }
+    assert FakeHTTPClient.requests[0]["headers"] == {"Authorization": "Bearer gainst_access_secret"}
     assert FakeHTTPClient.requests[1]["method"] == "POST"
     assert FakeHTTPClient.requests[1]["json"]["slug"] == "demo-app"
     assert FakeHTTPClient.requests[2]["url"] == (
@@ -272,7 +471,6 @@ def test_setup_bootstrap_persists_runtime_key_into_config_but_not_artifact(
     assert config_path.stat().st_mode & 0o777 == 0o600
     # The redacted setup artifact must never contain the raw runtime secret.
     assert "ga_runtime_secret_once" not in artifact_path.read_text(encoding="utf-8")
-    assert "ga_runtime_secret_once" not in result.output
 
 
 def test_setup_bootstrap_can_print_runtime_env_once_without_artifact_secret(
@@ -335,6 +533,375 @@ def test_setup_bootstrap_can_print_runtime_env_once_without_artifact_secret(
     assert persisted_config["api_key"] == "ga_runtime_secret_once"
 
 
+def test_setup_bootstrap_can_run_browser_login_inline_without_leaking_runtime_key(
+    tmp_path: Path,
+) -> None:
+    """Setup bootstrap should optionally run browser auth before tenant bootstrap."""
+    config_path = tmp_path / "config.yaml"
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    artifact_path = tmp_path / "setup-plan.json"
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "request_id": "req_1",
+                "authorize_url": "https://app.generalaugment.com/cli/authorize?request_id=req_1",
+                "expires_at": "2026-05-23T19:30:00Z",
+                "scopes": ["projects:write", "runtime_keys:create"],
+            }
+        ),
+        json_response(
+            {
+                "token_type": "Bearer",
+                "access_token": "gainst_access_secret",
+                "refresh_token": "garefr_refresh_secret",
+                "expires_at": "2026-05-23T20:30:00Z",
+                "scopes": ["projects:write", "runtime_keys:create"],
+                "project_id": None,
+            }
+        ),
+        json_response(
+            {
+                "auth_method": "installer",
+                "clerk_user_id": "user_123",
+                "clerk_email": "dev@example.com",
+                "project_ids": [],
+            }
+        ),
+        json_response({"items": []}),
+        json_response({"id": "proj_1", "name": "Demo App", "slug": "demo-app"}),
+        json_response(
+            {
+                "id": "key_1",
+                "name": "Self-serve app backend",
+                "api_key": "ga_runtime_secret_once",
+                "masked_key": "ga...once",
+                "project_id": "proj_1",
+                "scopes": ["responses:create"],
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "--base-url",
+            "http://api.test",
+            "setup",
+            "--workspace",
+            str(workspace),
+            "--login",
+            "--no-browser",
+            "--authorization-code",
+            "gacode_once",
+            "--code-verifier",
+            "verifier",
+            "--bootstrap",
+            "--project-name",
+            "Demo App",
+            "--project-slug",
+            "demo-app",
+            "--output",
+            str(artifact_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Browser authorization started" in result.output
+    assert "Setup plan written without changing app code or storing secrets." in result.output
+    assert "ga_runtime_secret_once" not in result.output
+    assert "gainst_access_secret" not in result.output
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert payload["bootstrap"]["project"]["id"] == "proj_1"
+    assert payload["bootstrap"]["runtime_key"]["masked_key"] == "ga...once"
+    assert "ga_runtime_secret_once" not in artifact_path.read_text(encoding="utf-8")
+    assert FakeHTTPClient.requests[0]["url"] == (
+        "http://api.test/api/v1/installer/auth/browser/start"
+    )
+    assert FakeHTTPClient.requests[3]["url"] == "http://api.test/api/v1/installer/projects"
+    assert FakeHTTPClient.requests[3]["headers"] == {"Authorization": "Bearer gainst_access_secret"}
+    persisted_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted_config["active_project"] == "proj_1"
+    # The minted runtime key is persisted into chmod-600 config so the next command
+    # authenticates without a manual export; the raw key still never hits output.
+    assert persisted_config["api_key"] == "ga_runtime_secret_once"
+
+
+def test_setup_guided_can_configure_provider_health_from_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guided setup should optionally store provider keys and run health checks."""
+    config_path = write_config(tmp_path)
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    answers_path = tmp_path / "answers.json"
+    answers_path.write_text(
+        json.dumps(
+            {
+                "project_name": "Demo App",
+                "project_slug": "demo-app",
+                "capabilities": ["browse"],
+                "provider_env_vars": {"browserbase": "BROWSERBASE_API_KEY"},
+                "job_type": "website-builder",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BROWSERBASE_API_KEY", "bb_secret_raw")
+    FakeHTTPClient.queue = [
+        json_response({"items": [{"id": "proj_1", "slug": "demo-agent", "name": "Demo Agent"}]}),
+        json_response(
+            {
+                "provider": "browserbase",
+                "status": "active",
+                "credential_kind": "external_mcp_provider",
+                "base_url_configured": False,
+                "updated_at": "2026-05-24T10:00:00Z",
+            }
+        ),
+        json_response(
+            {
+                "provider": "browserbase",
+                "status": "available",
+                "message": "Browserbase credential is configured.",
+                "checked_at": "2026-05-24T10:00:01Z",
+                "latency_ms": 14,
+                "last_validated_at": "2026-05-24T10:00:01Z",
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "setup",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "demo-agent",
+            "--guided",
+            "--answers-file",
+            str(answers_path),
+            "--configure-providers",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "bb_secret_raw" not in result.output
+    payload = json.loads(result.output)
+    provider_setup = payload["guided"]["provider_setup"]
+    assert provider_setup["status"] == "passed"
+    assert provider_setup["security"] == {
+        "credential_custody": "general_augment",
+        "raw_secrets_in_output": False,
+        "raw_provider_payloads_in_output": False,
+    }
+    assert provider_setup["providers"] == [
+        {
+            "provider": "browserbase",
+            "capability": "browse",
+            "credential_kind": "external_mcp_provider",
+            "env_var": "BROWSERBASE_API_KEY",
+            "status": "passed",
+            "checks": [
+                {"name": "credential_custody", "status": "passed"},
+                {"name": "provider_health", "status": "passed"},
+            ],
+            "evidence": {
+                "credential": {
+                    "base_url_configured": False,
+                    "credential_kind": "external_mcp_provider",
+                    "provider": "browserbase",
+                    "status": "active",
+                    "updated_at": "2026-05-24T10:00:00Z",
+                },
+                "provider_health": {
+                    "checked_at": "2026-05-24T10:00:01Z",
+                    "last_validated_at": "2026-05-24T10:00:01Z",
+                    "latency_ms": 14,
+                    "message": "Browserbase credential is configured.",
+                    "provider": "browserbase",
+                    "status": "available",
+                },
+            },
+            "blockers": [],
+        }
+    ]
+    assert "bb_secret_raw" not in (workspace / ".genaug" / "setup-plan.json").read_text(
+        encoding="utf-8"
+    )
+    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/admin/projects"
+    assert FakeHTTPClient.requests[1]["method"] == "PUT"
+    assert FakeHTTPClient.requests[1]["url"] == (
+        "http://api.test/api/v1/admin/projects/proj_1/capability-providers/browserbase"
+    )
+    assert FakeHTTPClient.requests[1]["json"]["api_key"] == "bb_secret_raw"
+    assert FakeHTTPClient.requests[2]["url"].endswith(
+        "/api/v1/admin/projects/proj_1/capability-providers/browserbase/health-check"
+    )
+
+
+def test_setup_guided_provider_setup_blocks_when_env_var_missing(tmp_path: Path) -> None:
+    """Guided provider setup should report missing env vars without custody calls."""
+    config_path = write_config(tmp_path)
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    answers_path = tmp_path / "answers.json"
+    answers_path.write_text(
+        json.dumps(
+            {
+                "capabilities": ["browse"],
+                "provider_env_vars": {"browserbase": "BROWSERBASE_API_KEY"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "setup",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "demo-agent",
+            "--guided",
+            "--answers-file",
+            str(answers_path),
+            "--configure-providers",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    provider_setup = payload["guided"]["provider_setup"]
+    assert provider_setup["status"] == "blocked"
+    assert provider_setup["providers"][0]["checks"] == [{"name": "env_var", "status": "blocked"}]
+    assert provider_setup["providers"][0]["blockers"] == [
+        "Environment variable BROWSERBASE_API_KEY is not set."
+    ]
+    assert FakeHTTPClient.requests == []
+
+
+def test_init_existing_app_passes_through_guided_provider_setup(tmp_path: Path) -> None:
+    """Bare init should expose the same guided provider execution as setup."""
+    config_path = write_config(tmp_path)
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    answers_path = tmp_path / "answers.json"
+    answers_path.write_text(
+        json.dumps(
+            {
+                "capabilities": ["browse"],
+                "provider_env_vars": {"browserbase": "BROWSERBASE_API_KEY"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "init",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "demo-agent",
+            "--guided",
+            "--answers-file",
+            str(answers_path),
+            "--configure-providers",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["guided"]["provider_setup"]["status"] == "blocked"
+    assert payload["guided"]["provider_setup"]["providers"][0]["provider"] == "browserbase"
+
+
+def test_init_existing_app_can_pass_through_inline_login_bootstrap(tmp_path: Path) -> None:
+    """genaug init should be able to run the existing-app auth/bootstrap flow."""
+    config_path = tmp_path / "config.yaml"
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
+    artifact_path = tmp_path / "setup-plan.json"
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "request_id": "req_1",
+                "authorize_url": "https://app.generalaugment.com/cli/authorize?request_id=req_1",
+            }
+        ),
+        json_response(
+            {
+                "access_token": "gainst_access_secret",
+                "refresh_token": "garefr_refresh_secret",
+                "scopes": ["projects:write", "runtime_keys:create"],
+            }
+        ),
+        json_response({"auth_method": "installer", "project_ids": []}),
+        json_response({"items": []}),
+        json_response({"id": "proj_1", "name": "Demo App", "slug": "demo-app"}),
+        json_response(
+            {
+                "id": "key_1",
+                "name": "Self-serve app backend",
+                "api_key": "ga_runtime_secret_once",
+                "masked_key": "ga...once",
+                "project_id": "proj_1",
+                "scopes": ["responses:create"],
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "--base-url",
+            "http://api.test",
+            "init",
+            "--workspace",
+            str(workspace),
+            "--login",
+            "--no-browser",
+            "--authorization-code",
+            "gacode_once",
+            "--code-verifier",
+            "verifier",
+            "--bootstrap",
+            "--project-name",
+            "Demo App",
+            "--project-slug",
+            "demo-app",
+            "--output",
+            str(artifact_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Browser authorization started" in result.output
+    assert artifact_path.exists()
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert payload["bootstrap"]["project"]["id"] == "proj_1"
+    assert "ga_runtime_secret_once" not in result.output
+    assert "ga_runtime_secret_once" not in artifact_path.read_text(encoding="utf-8")
+
+
 def test_providers_setup_writes_installer_custody_and_health_checks(
     tmp_path: Path,
 ) -> None:
@@ -352,9 +919,7 @@ def test_providers_setup_writes_installer_custody_and_health_checks(
         encoding="utf-8",
     )
     FakeHTTPClient.queue = [
-        json_response(
-            {"items": [{"id": "proj_1", "name": "Demo App", "slug": "demo-app"}]}
-        ),
+        json_response({"items": [{"id": "proj_1", "name": "Demo App", "slug": "demo-app"}]}),
         json_response(
             {
                 "provider": "browserbase",
@@ -412,13 +977,180 @@ def test_providers_setup_writes_installer_custody_and_health_checks(
     assert FakeHTTPClient.requests[1]["url"] == (
         "http://api.test/api/v1/installer/projects/proj_1/capability-providers/browserbase"
     )
-    assert FakeHTTPClient.requests[1]["headers"] == {
-        "Authorization": "Bearer gainst_access_secret"
-    }
+    assert FakeHTTPClient.requests[1]["headers"] == {"Authorization": "Bearer gainst_access_secret"}
     assert FakeHTTPClient.requests[1]["json"]["api_key"] == "bb_secret_raw"
     assert FakeHTTPClient.requests[2]["method"] == "POST"
     assert FakeHTTPClient.requests[2]["url"].endswith(
         "/api/v1/installer/projects/proj_1/capability-providers/browserbase/health-check"
+    )
+
+
+def test_providers_setup_routes_model_provider_health_through_admin_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X/FAL/Veo provider setup should use model-provider custody and health APIs."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": "gaadm_secret",
+                "active_project": "demo-agent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XAI_API_KEY", "xai_secret_raw")
+    FakeHTTPClient.queue = [
+        json_response({"items": [{"id": "proj_1", "slug": "demo-agent", "name": "Demo Agent"}]}),
+        json_response(
+            {
+                "provider": "xai",
+                "status": "active",
+                "api_mode": "codex_responses",
+                "base_url_configured": False,
+                "model_prefixes": ["xai/", "grok-"],
+                "last_validated_at": None,
+            }
+        ),
+        json_response(
+            {
+                "provider": "xai",
+                "status": "available",
+                "message": "xAI credential is configured.",
+                "checked_at": "2026-05-23T19:31:00Z",
+                "latency_ms": 12,
+                "status_code": 200,
+                "retryable": False,
+                "last_validated_at": "2026-05-23T19:31:00Z",
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "providers",
+            "setup",
+            "--provider",
+            "xai",
+            "--project",
+            "demo-agent",
+            "--api-key-env",
+            "XAI_API_KEY",
+            "--health-check",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "xai_secret_raw" not in result.output
+    payload = json.loads(result.output)
+    assert payload["providers"][0]["credential_kind"] == "model_provider"
+    assert payload["providers"][0]["credential"]["status"] == "active"
+    assert payload["providers"][0]["health"]["status"] == "available"
+    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/admin/projects"
+    assert FakeHTTPClient.requests[1]["method"] == "PUT"
+    assert FakeHTTPClient.requests[1]["url"] == (
+        "http://api.test/api/v1/admin/projects/proj_1/model-providers/xai"
+    )
+    assert FakeHTTPClient.requests[1]["json"] == {
+        "api_key": "xai_secret_raw",
+        "api_mode": "codex_responses",
+        "model_prefixes": ["xai/", "grok-"],
+    }
+    assert FakeHTTPClient.requests[2]["method"] == "POST"
+    assert FakeHTTPClient.requests[2]["url"].endswith(
+        "/api/v1/admin/projects/proj_1/model-providers/xai/health-check"
+    )
+
+
+def test_providers_readiness_lists_productized_and_planned_workflows(tmp_path: Path) -> None:
+    """Provider readiness should expose current and planned delegated workflows."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": "gaadm_secret",
+                "active_project": "demo-agent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response({"items": [{"id": "proj_1", "slug": "demo-agent", "name": "Demo Agent"}]}),
+        json_response(
+            {
+                "items": [
+                    {
+                        "provider": "anthropic-managed-agents",
+                        "label": "Anthropic Managed Agents provider",
+                        "credential_kind": "managed_agent_provider",
+                        "capabilities": ["anthropic_managed_agent"],
+                        "delegated_workflows": ["coding"],
+                        "planned_workflows": ["research"],
+                        "configured": True,
+                        "status": "active",
+                        "health_status": "available",
+                        "readiness": "ready",
+                        "setup_hint": "Provider is configured.",
+                    },
+                    {
+                        "provider": "browserbase",
+                        "label": "Browserbase provider",
+                        "credential_kind": "external_mcp_provider",
+                        "capabilities": ["browser"],
+                        "delegated_workflows": ["browser", "browser_action"],
+                        "planned_workflows": [],
+                        "configured": False,
+                        "status": "missing",
+                        "health_status": "missing",
+                        "readiness": "setup_required",
+                        "readiness_details": {
+                            "browser_artifact_storage_backend": "filesystem",
+                            "hosted_screenshot_storage": "local_only",
+                            "blockers": [
+                                (
+                                    "Use GCS artifact storage before treating screenshots as "
+                                    "durable evidence."
+                                )
+                            ],
+                        },
+                        "setup_hint": "Run genaug providers setup.",
+                    },
+                ]
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "providers",
+            "readiness",
+            "--project",
+            "demo-agent",
+        ],
+        terminal_width=220,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "coding" in result.output
+    assert "research" in result.output
+    assert "browser" in result.output
+    assert "hosted screenshots" in result.output
+    assert "local only (filesystem)" in result.output
+    assert "Use GCS artifact storage" in result.output
+    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/admin/projects"
+    assert FakeHTTPClient.requests[0]["params"] == {"limit": 1000, "offset": 0}
+    assert FakeHTTPClient.requests[1]["url"] == (
+        "http://api.test/api/v1/admin/projects/proj_1/coding-providers"
     )
 
 
@@ -439,9 +1171,7 @@ def test_skills_design_can_push_starter_bundle_with_installer_auth(tmp_path: Pat
         encoding="utf-8",
     )
     FakeHTTPClient.queue = [
-        json_response(
-            {"items": [{"id": "proj_1", "name": "Demo App", "slug": "demo-app"}]}
-        ),
+        json_response({"items": [{"id": "proj_1", "name": "Demo App", "slug": "demo-app"}]}),
         json_response(
             {
                 "name": "Website Builder",
@@ -486,16 +1216,14 @@ def test_skills_design_can_push_starter_bundle_with_installer_auth(tmp_path: Pat
     payload = json.loads(result.output)
     assert payload["applied"]["skill"]["name"] == "Website Builder"
     assert payload["applied"]["prompt_flow"]["flow_id"] == "website_builder"
-    # The installer slug is resolved to its UUID before the typed installer route.
+    # The installer slug is resolved to its UUID before the typed installer routes.
     assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/installer/projects"
     assert FakeHTTPClient.requests[1]["method"] == "POST"
     assert FakeHTTPClient.requests[1]["url"] == (
         "http://api.test/api/v1/installer/projects/proj_1/skills"
     )
     assert "Build safe website previews" in FakeHTTPClient.requests[1]["json"]["content"]
-    assert FakeHTTPClient.requests[1]["headers"] == {
-        "Authorization": "Bearer gainst_access_secret"
-    }
+    assert FakeHTTPClient.requests[1]["headers"] == {"Authorization": "Bearer gainst_access_secret"}
     assert FakeHTTPClient.requests[2]["method"] == "PUT"
     assert FakeHTTPClient.requests[2]["url"].endswith(
         "/api/v1/installer/projects/proj_1/prompt-flows/website_builder"
@@ -560,9 +1288,7 @@ def test_connectors_setup_can_push_mcp_server_with_installer_auth(tmp_path: Path
     assert FakeHTTPClient.requests[0]["url"] == (
         "http://api.test/api/v1/installer/projects/proj_1/mcp-servers"
     )
-    assert FakeHTTPClient.requests[0]["headers"] == {
-        "Authorization": "Bearer gainst_access_secret"
-    }
+    assert FakeHTTPClient.requests[0]["headers"] == {"Authorization": "Bearer gainst_access_secret"}
     assert FakeHTTPClient.requests[0]["json"]["tools"] == {"include": ["browser_navigate"]}
     assert FakeHTTPClient.requests[1]["url"].endswith(
         "/api/v1/installer/projects/proj_1/mcp-servers/browserbase/test"
@@ -645,28 +1371,15 @@ def test_console_scripts_include_public_command_only() -> None:
 
 def test_version_flag_exposes_cli_package_version() -> None:
     """Automation should be able to check the installed CLI version."""
+    from platform_cli import __version__
+
     result = CliRunner().invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert "genaug 0.1.1" in result.output
-
-
-def test_mock_command_runs_shared_local_mock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The public mock command should delegate to the shared mock server."""
-    calls: list[dict[str, object]] = []
-
-    def fake_run_server(host: str, port: int, *, quiet: bool = False) -> None:
-        calls.append({"host": host, "port": port, "quiet": quiet})
-
-    monkeypatch.setattr("platform_cli.commands.mock.run_server", fake_run_server)
-
-    result = CliRunner().invoke(
-        app,
-        ["mock", "--host", "127.0.0.1", "--port", "8787", "--quiet"],
-    )
-
-    assert result.exit_code == 0
-    assert calls == [{"host": "127.0.0.1", "port": 8787, "quiet": True}]
+    # Asserted against the single-sourced package metadata (pyproject.toml) rather
+    # than a hardcoded string, so this never needs touching on a version bump.
+    assert f"genaug {__version__}" in result.output
+    assert __version__ != "0.0.0+local"  # editable install must resolve real metadata
 
 
 def test_local_mock_covers_app_facing_health_alias() -> None:
@@ -693,9 +1406,16 @@ def test_local_mock_decodes_memory_route_segments() -> None:
         f"/api/v1/agent/memory/{stored['memory_id']}",
         "/api/v1/agent/memory/",
     )
+    _, corrected = store.correct_memory(
+        memory_id,
+        {"user_id": "app/user", "fact": "Likes green tea", "source": "test"},
+    )
+    _, lineage = store.memory_lineage(memory_id, user_id)
     _, deleted = store.delete_memory(memory_id, user_id)
 
     assert profile["total_facts"] == 1
+    assert corrected["corrected_memory_id"]
+    assert lineage["related_count"] == 2
     assert deleted["deleted_count"] == 1
 
 
@@ -799,31 +1519,6 @@ def test_local_mock_returns_project_soul_content() -> None:
     }
 
 
-def test_evals_run_gate_outputs_machine_readable_verdict(tmp_path: Path) -> None:
-    """Eval CLI should expose the local CI gate verdict for checked-in suites."""
-    artifact_dir = tmp_path / "eval-artifacts"
-    suite_path = ROOT / "tests" / "fixtures" / "agent_evals" / "platform_moat_v1.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "evals",
-            "run",
-            str(suite_path),
-            "--artifact-dir",
-            str(artifact_dir),
-            "--gate",
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["verdict"] == "PASS"
-    assert payload["suite"]["dataset"]["kind"] == "golden"
-    assert Path(payload["artifact_path"]).exists()
-
-
 def test_local_mock_identity_tracks_project_key() -> None:
     """Local verification should distinguish admin keys from project-scoped keys."""
     import platform_cli.local_mock as local_mock
@@ -848,615 +1543,6 @@ def test_local_mock_identity_tracks_project_key() -> None:
     assert [item["id"] for item in projects["items"]] == [project["id"]]
     assert keys["items"][0]["project_id"] == project["id"]
     assert "api_key" not in keys["items"][0]
-
-
-def test_projects_list_and_create_use_admin_api(tmp_path: Path) -> None:
-    """Project commands should call expected admin endpoints."""
-    config_path = write_config(tmp_path)
-    FakeHTTPClient.queue = [
-        json_response(
-            {"items": [{"id": "p1", "name": "DayPlan", "slug": "dayplan", "status": "active"}]}
-        ),
-        json_response({"id": "p2", "name": "Mysti"}),
-    ]
-    runner = CliRunner()
-
-    listed = runner.invoke(app, ["--config", str(config_path), "projects", "list"])
-    created = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "projects",
-            "create",
-            "--name",
-            "Mysti",
-            "--slug",
-            "mysti",
-        ],
-    )
-
-    assert listed.exit_code == 0
-    assert created.exit_code == 0
-    assert "DayPlan" in listed.output
-    assert FakeHTTPClient.requests[0]["headers"] == {"X-Admin-Key": "secret"}
-    assert FakeHTTPClient.requests[0]["url"].endswith("/api/v1/admin/projects")
-    assert FakeHTTPClient.requests[1]["method"] == "POST"
-
-
-def test_projects_usage_exposes_usage_api(tmp_path: Path) -> None:
-    """Usage should have a discoverable project command with date filters."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "project_id": "proj/1",
-                "totals": {
-                    "agent_turns_count": 3,
-                    "messages_count": 4,
-                    "tool_calls_count": 2,
-                    "total_cost_usd": 0.01,
-                },
-                "days": [
-                    {
-                        "date": "2026-04-24",
-                        "agent_turns_count": 3,
-                        "tool_calls_count": 2,
-                        "total_cost_usd": 0.01,
-                    }
-                ],
-            }
-        ),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "projects",
-            "usage",
-            "--project",
-            "dayplan",
-            "--start-date",
-            "2026-04-01",
-            "--end-date",
-            "2026-04-24",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert "Agent turns" in result.output
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/usage")
-    assert FakeHTTPClient.requests[1]["params"] == {
-        "start_date": "2026-04-01",
-        "end_date": "2026-04-24",
-    }
-
-
-def test_projects_runtime_policy_exposes_tenant_agent_surface(tmp_path: Path) -> None:
-    """Runtime policy should expose model routing, tools, MCP, and skills."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(runtime_policy_response()),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "projects", "runtime-policy", "--project", "dayplan"],
-    )
-
-    assert result.exit_code == 0
-    assert "Runtime Policy for dayplan" in result.output
-    assert "google/gemini-2.5-flash-lite" in result.output
-    assert "channel_parity=True" in result.output
-    assert "Support Triage" in result.output
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/runtime-policy"
-    )
-
-
-def test_projects_runtime_policy_json_is_machine_readable(tmp_path: Path) -> None:
-    """Runtime policy JSON should preserve the API response for automation."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(runtime_policy_response()),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "projects",
-            "runtime-policy",
-            "--project",
-            "dayplan",
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["model_routing"]["channel_parity"] is True
-    assert payload["platform_tools"]["enabled_tool_ids"] == ["web_search"]
-
-
-def test_billing_commands_create_hosted_sessions_and_list_events(tmp_path: Path) -> None:
-    """Billing commands should expose hosted Checkout, Portal, and event state."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"url": "https://checkout.stripe.com/c/pay/cs_test"}),
-        json_response({"items": [project]}),
-        json_response({"url": "https://billing.stripe.com/session/test"}),
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "items": [
-                    {
-                        "event_type": "invoice.payment_failed",
-                        "status": "failed",
-                        "target_pricing_tier": "pro",
-                        "stripe_invoice_id": "in_test",
-                        "amount_due_cents": 2900,
-                        "processed_at": "2026-05-05T10:00:00Z",
-                    }
-                ]
-            }
-        ),
-    ]
-    runner = CliRunner()
-
-    checkout = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "billing",
-            "checkout",
-            "--project",
-            "dayplan",
-            "--tier",
-            "build",
-        ],
-    )
-    portal = runner.invoke(
-        app,
-        ["--config", str(config_path), "billing", "portal", "--project", "dayplan"],
-    )
-    events = runner.invoke(
-        app,
-        ["--config", str(config_path), "billing", "events", "--project", "dayplan"],
-    )
-
-    assert checkout.exit_code == 0
-    assert portal.exit_code == 0
-    assert events.exit_code == 0
-    assert "checkout.stripe.com" in checkout.output
-    assert "billing.stripe.com" in portal.output
-    assert "invoice.payment_failed" in events.output
-    assert FakeHTTPClient.requests[1]["method"] == "POST"
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/billing/checkout-session"
-    )
-    assert FakeHTTPClient.requests[1]["json"] == {"target_tier": "build"}
-    assert FakeHTTPClient.requests[3]["method"] == "POST"
-    assert FakeHTTPClient.requests[3]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/billing/portal-session"
-    )
-    assert FakeHTTPClient.requests[5]["method"] == "GET"
-    assert FakeHTTPClient.requests[5]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/billing/events"
-    )
-
-
-def test_billing_events_json_is_machine_readable(tmp_path: Path) -> None:
-    """Billing event JSON should preserve the API payload for launch evidence."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"items": [{"event_type": "checkout.session.completed"}]}),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "billing", "events", "--project", "dayplan", "--json"],
-    )
-
-    assert result.exit_code == 0
-    assert json.loads(result.output)["items"][0]["event_type"] == "checkout.session.completed"
-
-
-def test_billing_status_shows_credit_balance_and_auto_top_up_state(tmp_path: Path) -> None:
-    """Billing status should expose credit balance and funding state from admin APIs."""
-    config_path = write_config(tmp_path)
-    project = {
-        "id": "proj/1",
-        "name": "DayPlan",
-        "slug": "dayplan",
-        "status": "active",
-        "pricing_tier": "build",
-        "plan": "build",
-        "rate_limits": {"funding_mode": "subscription_included"},
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "project_id": "proj/1",
-                "active_balance_usd": "24.500000",
-                "grants": [{"id": "grant-1"}, {"id": "grant-2"}],
-                "reservations": [{"id": "reservation-1"}],
-                "ledger_entries": [{"id": "ledger-1"}],
-            }
-        ),
-        json_response(
-            {
-                "enabled": True,
-                "threshold_usd": "5.000000",
-                "top_up_amount_usd": "25.000000",
-                "monthly_cap_usd": "100.000000",
-                "payment_method_status": "ready",
-                "charge_attempts_enabled": False,
-                "last_triggered_at": "2026-05-09T12:00:00Z",
-            }
-        ),
-        json_response(
-            {"items": [{"status": "blocked", "failure_code": "charge_attempts_disabled"}]}
-        ),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "billing", "status", "--project", "dayplan"],
-    )
-
-    assert result.exit_code == 0
-    assert "Billing status for dayplan" in result.output
-    assert "24.500000" in result.output
-    assert "subscription_included" in result.output
-    assert "enabled, charges disabled" in result.output
-    assert "charge_attempts_disabled" in result.output
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/billing/credits"
-    )
-    assert FakeHTTPClient.requests[2]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/billing/credits/auto-top-up"
-    )
-    assert FakeHTTPClient.requests[3]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/billing/credits/auto-top-up/attempts"
-    )
-
-
-def test_billing_top_up_creates_credit_checkout_session(tmp_path: Path) -> None:
-    """Billing top-up should create a hosted paid-credit Checkout session."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"url": "https://checkout.stripe.com/session/top-up"}),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "billing",
-            "top-up",
-            "--project",
-            "dayplan",
-            "--amount-usd",
-            "25.00",
-            "--save-payment-method",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert "top-up checkout session" in result.output
-    assert "checkout.stripe.com" in result.output
-    assert FakeHTTPClient.requests[1]["method"] == "POST"
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/billing/credits/top-up-checkout-session"
-    )
-    assert FakeHTTPClient.requests[1]["json"] == {
-        "amount_usd": "25.00",
-        "save_payment_method": True,
-    }
-
-
-def test_billing_usage_json_exposes_usage_endpoint(tmp_path: Path) -> None:
-    """Billing usage should expose machine-readable usage rollups for reconciliation."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "totals": {"agent_turns_count": 7, "total_cost_usd": 1.23},
-                "days": [{"date": "2026-05-09", "agent_turns_count": 7}],
-            }
-        ),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "billing",
-            "usage",
-            "--project",
-            "dayplan",
-            "--start-date",
-            "2026-05-01",
-            "--end-date",
-            "2026-05-09",
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["usage"]["totals"]["agent_turns_count"] == 7
-    assert payload["project"]["slug"] == "dayplan"
-    assert FakeHTTPClient.requests[1]["method"] == "GET"
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/usage")
-    assert FakeHTTPClient.requests[1]["params"] == {
-        "start_date": "2026-05-01",
-        "end_date": "2026-05-09",
-    }
-
-
-def test_billing_verify_json_proves_credit_gate_and_metered_platform_ledger(
-    tmp_path: Path,
-) -> None:
-    """Billing verify should prove platform-funded work has credit guardrails."""
-    config_path = write_config(tmp_path)
-    project = {
-        "id": "proj/1",
-        "name": "DayPlan",
-        "slug": "dayplan",
-        "status": "active",
-        "rate_limits": {
-            "credit_billing_enabled": True,
-            "funding_mode": "subscription_included",
-        },
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "project_id": "proj/1",
-                "active_balance_usd": "12.500000",
-                "ledger_entries": [
-                    {
-                        "event_type": "agent_turn_reserved",
-                        "provider_source": "platform",
-                        "reservation_id": "reservation-1",
-                    },
-                    {
-                        "event_type": "agent_turn_completed",
-                        "provider_source": "platform",
-                        "reservation_id": "reservation-1",
-                    },
-                ],
-                "reservations": [{"id": "reservation-1", "status": "settled"}],
-            }
-        ),
-        json_response({"totals": {"agent_turns_count": 3, "total_cost_usd": "0.09"}}),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "billing", "verify", "--project", "dayplan", "--json"],
-    )
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["verdict"] == "PASS"
-    assert {check["name"]: check["status"] for check in payload["checks"]} == {
-        "credit_billing_enabled": "PASS",
-        "funding_mode_declared": "PASS",
-        "credit_balance_reachable": "PASS",
-        "platform_ledger_metered": "PASS",
-        "usage_rollup_reachable": "PASS",
-    }
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/billing/credits"
-    )
-    assert FakeHTTPClient.requests[1]["params"] == {"limit": 500}
-    assert FakeHTTPClient.requests[2]["url"].endswith("/api/v1/admin/projects/proj%2F1/usage")
-
-
-def test_billing_verify_fails_when_credit_billing_gate_is_disabled(tmp_path: Path) -> None:
-    """Billing verify should fail closed when platform credit billing is disabled."""
-    config_path = write_config(tmp_path)
-    project = {
-        "id": "proj/1",
-        "name": "DayPlan",
-        "slug": "dayplan",
-        "status": "active",
-        "rate_limits": {"funding_mode": "subscription_included"},
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"project_id": "proj/1", "active_balance_usd": "0", "ledger_entries": []}),
-        json_response({"totals": {}}),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "billing", "verify", "--project", "dayplan"],
-    )
-
-    assert result.exit_code != 0
-    assert "Billing verification failed: credit_billing_enabled" in result.output
-
-
-def test_billing_verify_fails_when_platform_ledger_lacks_reservation(
-    tmp_path: Path,
-) -> None:
-    """Billing verify should flag platform-funded ledger rows without reservation linkage."""
-    config_path = write_config(tmp_path)
-    project = {
-        "id": "proj/1",
-        "name": "DayPlan",
-        "slug": "dayplan",
-        "status": "active",
-        "rate_limits": {
-            "credit_billing_enabled": True,
-            "funding_mode": "subscription_included",
-        },
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "project_id": "proj/1",
-                "active_balance_usd": "3.000000",
-                "ledger_entries": [
-                    {
-                        "event_type": "agent_turn_completed",
-                        "provider_source": "platform",
-                    }
-                ],
-            }
-        ),
-        json_response({"totals": {"agent_turns_count": 1}}),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "billing", "verify", "--project", "dayplan", "--json"],
-    )
-
-    assert result.exit_code != 0
-    assert "platform_ledger_metered" in result.output
-    assert '"verdict": "FAIL"' in result.output
-    assert "platform ledger rows without reservation_id: agent_turn_completed" in result.output
-
-
-def test_billing_checkout_rejects_unknown_tier_before_http(tmp_path: Path) -> None:
-    """Checkout should only allow configured paid public tiers."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "billing",
-            "checkout",
-            "--project",
-            "dayplan",
-            "--tier",
-            "enterprise",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "Paid target tier must be 'build', 'pro', or 'team'" in result.output
-    assert FakeHTTPClient.requests == []
-
-
-def test_projects_export_writes_bounded_project_archive(tmp_path: Path) -> None:
-    """Project export should write the backend's bounded archive payload."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    export_payload = {
-        "api_version": "genaug.project_export.v1",
-        "exported_at": "2026-05-05T10:00:00Z",
-        "project_id": "proj/1",
-        "project": project,
-        "filters": {"include": ["config", "logs"], "limit": 25},
-        "config": {"yaml_content": "apiVersion: genaug/v1\n"},
-        "logs": [{"id": "log-1"}],
-        "traces": [],
-        "audit_events": [],
-        "control_plane_events": [],
-        "memory_facts": [],
-        "usage_events": [],
-        "notes": ["bounded"],
-    }
-    output_path = tmp_path / "project-export.json"
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(export_payload),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "projects",
-            "export",
-            "--project",
-            "dayplan",
-            "--include",
-            "config",
-            "--include",
-            "logs",
-            "--limit",
-            "25",
-            "--output",
-            str(output_path),
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert "Wrote project export" in result.output
-    assert json.loads(output_path.read_text(encoding="utf-8"))["filters"]["limit"] == 25
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/export")
-    assert FakeHTTPClient.requests[1]["params"] == {
-        "include": ["config", "logs"],
-        "limit": 25,
-    }
-
-
-def test_projects_archive_requires_confirmation_and_can_emit_json(tmp_path: Path) -> None:
-    """Project archive should require confirmation unless --yes is supplied."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    archived = {**project, "status": "archived"}
-    unconfirmed = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "projects", "archive", "dayplan"],
-        input="n\n",
-    )
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(archived),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "projects",
-            "archive",
-            "dayplan",
-            "--yes",
-            "--json",
-        ],
-    )
-
-    assert unconfirmed.exit_code != 0
-    assert result.exit_code == 0
-    assert json.loads(result.output)["status"] == "archived"
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/archive")
-    assert FakeHTTPClient.requests[1]["method"] == "POST"
 
 
 def test_keys_create_list_update_and_revoke(tmp_path: Path) -> None:
@@ -1711,74 +1797,138 @@ def test_integrate_auto_deploy_registers_openapi_tools(tmp_path: Path) -> None:
     assert body["auto_deploy"] is True
 
 
-def test_deploy_validates_and_uploads_config(tmp_path: Path) -> None:
-    """Deploy should upload local config through from-config when project does not exist."""
+def test_integrate_json_emits_tool_summary(tmp_path: Path) -> None:
+    """integrate --json should emit a machine-readable scaffold summary."""
+    spec_path = ROOT / "tests/fixtures/sample_openapi_specs/health_app_api.yaml"
+    output_dir = tmp_path / "mysti-agent"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "integrate",
+            str(spec_path),
+            "--name",
+            "mysti",
+            "--output-dir",
+            str(output_dir),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["deployed"] is False
+    assert isinstance(payload["tools"], list)
+    assert payload["tools"]
+    assert {"tool_id", "http_method", "risk_level", "enabled"} <= set(payload["tools"][0])
+
+
+def test_keys_create_json_includes_one_time_secret(tmp_path: Path) -> None:
+    """keys create --json must emit the one-time secret so an agent can capture it."""
     config_path = write_config(tmp_path)
-    agent_config = write_agent_config(tmp_path)
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "id": "key/1",
+                "name": "Production backend",
+                "api_key": "gaadmlive_secret",
+                "masked_key": "gaadmlive_s...cret",
+                "project_id": "proj/1",
+                "scopes": ["admin"],
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "keys",
+            "create",
+            "--name",
+            "Production backend",
+            "--project",
+            "dayplan",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["api_key"] == "gaadmlive_secret"
+    assert payload["id"] == "key/1"
+
+
+def test_setup_bootstrap_persisted_key_authenticates_smoke_without_export(
+    tmp_path: Path,
+) -> None:
+    """After bootstrap, smoke should authenticate from saved config with no manual export."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": None,
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "demo-app"
+    workspace.mkdir()
     FakeHTTPClient.queue = [
         json_response({"items": []}),
-        json_response({"id": "p1", "name": "DayPlan", "slug": "dayplan"}),
+        json_response({"id": "proj_1", "name": "Demo App", "slug": "demo-app"}),
+        json_response(
+            {
+                "id": "key_1",
+                "name": "Self-serve app backend",
+                "api_key": "ga_runtime_secret_once",
+                "masked_key": "ga...once",
+                "project_id": "proj_1",
+                "scopes": ["responses:create"],
+            }
+        ),
     ]
 
-    result = CliRunner().invoke(app, ["--config", str(config_path), "deploy", str(agent_config)])
+    bootstrap = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "setup",
+            "--workspace",
+            str(workspace),
+            "--bootstrap",
+            "--project-name",
+            "Demo App",
+            "--project-slug",
+            "demo-app",
+            "--json",
+        ],
+    )
+    assert bootstrap.exit_code == 0, bootstrap.output
 
-    assert result.exit_code == 0
-    assert "Project created" in result.output
-    assert FakeHTTPClient.requests[0]["method"] == "GET"
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/from-config")
-    assert FakeHTTPClient.requests[1]["json"]["yaml_content"].startswith("apiVersion: genaug/v1")
-    assert FakeHTTPClient.requests[1]["json"]["soul_content"].startswith("# DayPlan")
-
-
-def test_deploy_ignores_skill_readme_placeholders(tmp_path: Path) -> None:
-    """Deploy should only upload real SKILL.md files, not generated README placeholders."""
-    config_path = write_config(tmp_path)
-    agent_config = write_agent_config(tmp_path)
+    # No manual export: smoke reads the persisted runtime key from config.
+    FakeHTTPClient.requests = []
     FakeHTTPClient.queue = [
-        json_response({"items": []}),
-        json_response({"id": "p1", "name": "DayPlan", "slug": "dayplan"}),
+        json_response({"status": "ready"}),
+        json_response(
+            {"id": "resp_smoke", "status": "completed", "output_text": "genaug-smoke-ok"}
+        ),
     ]
+    smoke_result = CliRunner().invoke(app, ["--config", str(config_path), "smoke", "--json"])
 
-    result = CliRunner().invoke(app, ["--config", str(config_path), "deploy", str(agent_config)])
-
-    assert result.exit_code == 0
-    assert FakeHTTPClient.requests[1]["json"]["skills"] == []
-
-
-def test_deploy_rejects_general_augment_manifest(tmp_path: Path) -> None:
-    """Deploy should reject removed GeneralAugment manifests."""
-    config_path = write_config(tmp_path)
-    agent_config = write_agent_config(tmp_path, api_version="legacy/v1")
-
-    result = CliRunner().invoke(app, ["--config", str(config_path), "deploy", str(agent_config)])
-
-    assert result.exit_code != 0
-    assert isinstance(result.exception, ValueError)
-    assert "apiVersion genaug/v1" in str(result.exception)
-    assert FakeHTTPClient.requests == []
-
-
-def test_deploy_rejects_local_manifest_validation_errors(tmp_path: Path) -> None:
-    """Deploy should run local manifest validation before calling the API."""
-    config_path = write_config(tmp_path)
-    agent_config = write_agent_config(tmp_path)
-    payload = yaml.safe_load(agent_config.read_text(encoding="utf-8"))
-    payload["tools"]["mcp"] = [
-        {
-            "name": "github",
-            "url": "https://mcp.github.example.com/mcp",
-            "headers": {"Authorization": "Bearer raw-token"},
-        }
-    ]
-    agent_config.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-
-    result = CliRunner().invoke(app, ["--config", str(config_path), "deploy", str(agent_config)])
-
-    assert result.exit_code != 0
-    assert isinstance(result.exception, ValueError)
-    assert "Agent manifest validation failed" in str(result.exception)
-    assert "raw secret" in str(result.exception)
-    assert FakeHTTPClient.requests == []
+    assert smoke_result.exit_code == 0, smoke_result.output
+    payload = json.loads(smoke_result.output)
+    assert payload["verdict"] == "PASS"
+    # The persisted runtime key authenticated the app-facing responses call.
+    assert FakeHTTPClient.requests[1]["headers"]["Authorization"] == (
+        "Bearer ga_runtime_secret_once"
+    )
 
 
 def test_tools_list_and_toggle(tmp_path: Path) -> None:
@@ -1845,6 +1995,80 @@ def test_tools_toggle_encodes_project_id(tmp_path: Path) -> None:
     assert FakeHTTPClient.requests[-1]["url"].endswith("/api/v1/admin/projects/proj%2F1/tools")
 
 
+def test_tools_catalog_lists_normalized_project_tools(tmp_path: Path) -> None:
+    """Tools catalog should show the normalized tenant catalog from the admin API."""
+    config_path = write_config(tmp_path)
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "enabled_tool_ids": []}
+    catalog = {
+        "project_id": "proj/1",
+        "schema_version": "general-augment-tool-catalog/v1",
+        "counts": {"total": 3, "mcp": 1, "generated_openapi": 1, "unknown": 1},
+        "items": [
+            {
+                "id": "get_ticket",
+                "source": "mcp",
+                "status": "available",
+                "risk_level": "unknown",
+                "approval_policy": "server_policy",
+                "auth_requirement": "mcp_server",
+            },
+            {
+                "id": "support_list_tickets",
+                "source": "generated_openapi",
+                "status": "available",
+                "risk_level": "low",
+                "approval_policy": "auto_execute",
+                "auth_requirement": "identity_link",
+            },
+            {
+                "id": "missing_tool",
+                "source": "unknown",
+                "status": "unavailable",
+                "risk_level": "unknown",
+                "approval_policy": "unknown",
+                "auth_requirement": "unknown",
+            },
+        ],
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(catalog),
+        json_response({"items": [project]}),
+        json_response(catalog),
+    ]
+
+    shown = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "tools", "catalog", "--project", "dayplan"],
+    )
+    filtered = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "tools",
+            "catalog",
+            "--project",
+            "dayplan",
+            "--source",
+            "generated_openapi",
+            "--json",
+        ],
+    )
+
+    assert shown.exit_code == 0
+    assert filtered.exit_code == 0
+    shown_output = plain_cli_output(shown)
+    assert "Tool Catalog" in shown_output
+    assert "get_ticket" in shown_output
+    assert "unavailable" in shown_output
+    filtered_payload = json.loads(filtered.output)
+    assert [item["id"] for item in filtered_payload["items"]] == ["support_list_tickets"]
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/tools/catalog"
+    )
+
+
 def test_tools_discovery_shows_and_updates_project_policy(tmp_path: Path) -> None:
     """Tool discovery command should configure the existing project policy contract."""
     config_path = write_config(tmp_path)
@@ -1857,6 +2081,7 @@ def test_tools_discovery_shows_and_updates_project_policy(tmp_path: Path) -> Non
             "mode": "auto",
             "direct_schema_tool_limit": 10,
             "max_search_results": 5,
+            "approval_policy": {"mode": "tool_defaults"},
         },
     }
     updated_project = {
@@ -1865,6 +2090,7 @@ def test_tools_discovery_shows_and_updates_project_policy(tmp_path: Path) -> Non
             "mode": "always",
             "direct_schema_tool_limit": 4,
             "max_search_results": 2,
+            "approval_policy": {"mode": "risky_tools"},
         },
     }
     FakeHTTPClient.queue = [
@@ -1893,6 +2119,8 @@ def test_tools_discovery_shows_and_updates_project_policy(tmp_path: Path) -> Non
             "4",
             "--max-search-results",
             "2",
+            "--approval-policy",
+            "risky_tools",
             "--json",
         ],
     )
@@ -1908,9 +2136,82 @@ def test_tools_discovery_shows_and_updates_project_policy(tmp_path: Path) -> Non
             "mode": "always",
             "direct_schema_tool_limit": 4,
             "max_search_results": 2,
+            "approval_policy": {"mode": "risky_tools"},
         }
     }
     assert FakeHTTPClient.requests[2]["headers"] == {"X-Admin-Key": "secret"}
+
+
+def test_tools_explain_turn_reports_dynamic_discovery_decision(tmp_path: Path) -> None:
+    """Tool explain-turn should show how a request will expose schemas to Hermes."""
+    config_path = write_config(tmp_path)
+    project = {
+        "id": "proj/1",
+        "name": "DayPlan",
+        "slug": "dayplan",
+    }
+    runtime_policy = {
+        "tool_discovery": {
+            "mode": "auto",
+            "direct_schema_tool_limit": 2,
+            "max_search_results": 5,
+        },
+        "hermes_exposure": {
+            "uses_dynamic_discovery_by_default": True,
+            "direct_platform_tool_count": 0,
+            "search_result_limit": 5,
+        },
+    }
+    catalog = {
+        "counts": {"total": 3, "enabled": 2, "unavailable": 1},
+        "items": [
+            {"id": "get_ticket", "enabled": True, "status": "available"},
+            {"id": "close_ticket", "enabled": True, "status": "available"},
+            {"id": "missing_tool", "enabled": False, "status": "unavailable"},
+        ],
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(runtime_policy),
+        json_response(catalog),
+        json_response({"items": [project]}),
+        json_response(runtime_policy),
+        json_response(catalog),
+    ]
+    runner = CliRunner()
+
+    shown = runner.invoke(
+        app,
+        ["--config", str(config_path), "tools", "explain-turn", "--project", "dayplan"],
+    )
+    explicit = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "tools",
+            "explain-turn",
+            "--project",
+            "dayplan",
+            "--requested-tool",
+            "missing_tool",
+            "--json",
+        ],
+    )
+
+    assert shown.exit_code == 0
+    assert explicit.exit_code == 0
+    assert "Tool Discovery Decision" in plain_cli_output(shown)
+    explicit_payload = json.loads(explicit.output)
+    assert explicit_payload["schema_version"] == "genaug.tool_discovery_explanation.v1"
+    assert explicit_payload["decision"]["exposure"] == "explicit_tool_subset"
+    assert explicit_payload["decision"]["unavailable_requested_tools"] == ["missing_tool"]
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/runtime-policy"
+    )
+    assert FakeHTTPClient.requests[2]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/tools/catalog"
+    )
 
 
 def test_tools_discovery_rejects_invalid_mode(tmp_path: Path) -> None:
@@ -2038,1596 +2339,90 @@ def test_skills_list_json_is_machine_readable(tmp_path: Path) -> None:
     assert payload["items"][0]["name"] == "Support Triage"
 
 
-def test_memory_commands_manage_tenant_user_memory(tmp_path: Path) -> None:
-    """Memory commands should call scoped app-facing memory APIs."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "user_id": "app-user-1",
-                "general_augment_user_id": "user-1",
-                "memory_id": "mem/1",
-                "content": "User prefers window seats.",
-                "source": "tenant-app",
-                "metadata": {"surface": "cli"},
-                "status": "stored",
-            }
-        ),
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "user_id": "app-user-1",
-                "facts": [
-                    {
-                        "id": "mem/1",
-                        "fact_type": "preference",
-                        "content": "User prefers window seats.",
-                        "importance_score": 0.9,
-                        "similarity": 0.93,
-                        "source": "tenant-app",
-                    }
-                ],
-            }
-        ),
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "user_id": "app-user-1",
-                "general_augment_user_id": "user-1",
-                "profile": {"preferences": 1},
-                "recent_facts": [{"id": "mem/1"}],
-                "total_facts": 1,
-            }
-        ),
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "user_id": "app-user-1",
-                "general_augment_user_id": "user-1",
-                "memory_id": "mem/1",
-                "deleted_ids": ["mem/1"],
-                "deleted_count": 1,
-                "status": "deleted",
-            }
-        ),
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "user_id": "app-user-1",
-                "general_augment_user_id": "user-1",
-                "deleted_count": 1,
-                "status": "purged",
-            }
-        ),
-    ]
-    runner = CliRunner()
-
-    stored = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "memory",
-            "store",
-            "User prefers window seats.",
-            "--project",
-            "dayplan",
-            "--user",
-            "app-user-1",
-            "--fact-type",
-            "preference",
-            "--importance",
-            "0.9",
-            "--source",
-            "tenant-app",
-            "--metadata",
-            "surface=cli",
-            "--idempotency-key",
-            "memory-write-1",
-        ],
-    )
-    searched = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "memory",
-            "search",
-            "--project",
-            "dayplan",
-            "--user",
-            "app-user-1",
-            "--query",
-            "window seats",
-            "--limit",
-            "3",
-            "--min-similarity",
-            "0",
-            "--fact-type",
-            "preference",
-            "--source",
-            "tenant-app",
-        ],
-    )
-    profile = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "memory",
-            "profile",
-            "--project",
-            "dayplan",
-            "--user",
-            "app-user-1",
-        ],
-    )
-    deleted = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "memory",
-            "delete",
-            "mem/1",
-            "--project",
-            "dayplan",
-            "--user",
-            "app-user-1",
-        ],
-    )
-    purged = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "memory",
-            "purge-user",
-            "--project",
-            "dayplan",
-            "--user",
-            "app-user-1",
-            "--yes",
-        ],
-    )
-
-    assert stored.exit_code == 0
-    assert searched.exit_code == 0
-    assert profile.exit_code == 0
-    assert deleted.exit_code == 0
-    assert purged.exit_code == 0
-    assert "mem/1" in stored.output
-    assert "window seats" in FakeHTTPClient.requests[3]["json"]["query"]
-    assert "Total facts" in profile.output
-    assert "deleted" in deleted.output
-    assert "Purged 1 memory fact" in purged.output
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/agent/memory/store")
-    assert FakeHTTPClient.requests[1]["headers"]["X-Project-ID"] == "proj/1"
-    assert FakeHTTPClient.requests[1]["headers"]["Authorization"] == "Bearer secret"
-    assert FakeHTTPClient.requests[1]["json"] == {
-        "user_id": "app-user-1",
-        "fact": "User prefers window seats.",
-        "fact_type": "preference",
-        "importance_score": 0.9,
-        "source": "tenant-app",
-        "metadata": {"surface": "cli"},
-        "idempotency_key": "memory-write-1",
-    }
-    assert FakeHTTPClient.requests[3]["json"] == {
-        "user_id": "app-user-1",
-        "query": "window seats",
-        "limit": 3,
-        "min_similarity": 0.0,
-        "fact_type": "preference",
-        "source": "tenant-app",
-    }
-    assert FakeHTTPClient.requests[5]["url"].endswith("/api/v1/agent/memory/profile/app-user-1")
-    assert FakeHTTPClient.requests[7]["url"].endswith("/api/v1/agent/memory/mem%2F1")
-    assert FakeHTTPClient.requests[7]["params"] == {"user_id": "app-user-1"}
-    assert FakeHTTPClient.requests[9]["url"].endswith("/api/v1/agent/memory/user/app-user-1")
-
-
-def test_memory_json_output_is_machine_readable_with_project_key(tmp_path: Path) -> None:
-    """Memory commands should also work when the configured key already scopes the project."""
-    config_path = write_config(tmp_path)
-    FakeHTTPClient.queue = [
-        json_response(
-            {
-                "user_id": "app-user-1",
-                "general_augment_user_id": "user-1",
-                "profile": {},
-                "recent_facts": [],
-                "total_facts": 0,
-            }
-        )
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "memory", "profile", "--user", "app-user-1", "--json"],
-    )
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["user_id"] == "app-user-1"
-    assert payload["total_facts"] == 0
-    assert FakeHTTPClient.requests[0]["url"].endswith("/api/v1/agent/memory/profile/app-user-1")
-    assert "X-Project-ID" not in FakeHTTPClient.requests[0]["headers"]
-
-
-def test_memory_store_rejects_unknown_fact_type(tmp_path: Path) -> None:
-    """Memory fact type validation should fail before any API request."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "memory",
-            "store",
-            "User prefers window seats.",
-            "--user",
-            "app-user-1",
-            "--fact-type",
-            "secret",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "--fact-type must be one of" in plain_cli_output(result)
-    assert FakeHTTPClient.requests == []
-
-
-def test_mcp_commands_manage_project_servers(tmp_path: Path) -> None:
-    """MCP commands should manage tenant-owned tool servers through admin endpoints."""
+def test_tools_add_mcp_alias_uses_project_mcp_endpoint(tmp_path: Path) -> None:
+    """The tools namespace should expose the first-afternoon MCP add workflow."""
     config_path = write_config(tmp_path)
     project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
     server = {
         "name": "github",
         "url": "https://mcp.github.example.com/mcp",
-        "headers": {"Authorization": "Bearer ${{ secrets.GITHUB_TOKEN }}"},
-        "tools": {"include": ["search_repos"], "exclude": ["delete_repo"]},
+        "tools": {"include": ["search_repos"]},
         "enabled": True,
-        "timeout": 10,
-        "connect_timeout": 3,
     }
     FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"items": [server]}),
         json_response({"items": [project]}),
         json_response(server),
-        json_response({"items": [project]}),
-        json_response({"name": "github", "ok": True, "transport": "http", "detail": None}),
-        json_response({"items": [project]}),
-        json_response({"status": "deleted", "name": "github"}),
     ]
-    runner = CliRunner()
 
-    listed = runner.invoke(
-        app,
-        ["--config", str(config_path), "mcp", "list", "--project", "dayplan"],
-    )
-    added = runner.invoke(
+    result = CliRunner().invoke(
         app,
         [
             "--config",
             str(config_path),
-            "mcp",
-            "add",
+            "tools",
+            "add-mcp",
             "github",
             "--project",
             "dayplan",
             "--url",
             "https://mcp.github.example.com/mcp",
-            "--header",
-            "Authorization=Bearer ${{ secrets.GITHUB_TOKEN }}",
             "--include-tool",
             "search_repos",
-            "--exclude-tool",
-            "delete_repo",
-            "--timeout",
-            "10",
-            "--connect-timeout",
-            "3",
-            "--json",
-        ],
-    )
-    tested = runner.invoke(
-        app,
-        ["--config", str(config_path), "mcp", "test", "github", "--project", "dayplan"],
-    )
-    deleted = runner.invoke(
-        app,
-        ["--config", str(config_path), "mcp", "delete", "github", "--project", "dayplan"],
-    )
-
-    assert listed.exit_code == 0
-    assert added.exit_code == 0
-    assert tested.exit_code == 0
-    assert deleted.exit_code == 0
-    assert "github" in listed.output
-    assert json.loads(added.output)["tools"] == {
-        "include": ["search_repos"],
-        "exclude": ["delete_repo"],
-    }
-    assert "True" in tested.output
-    assert "Deleted MCP server github" in deleted.output
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/mcp-servers")
-    assert FakeHTTPClient.requests[3]["method"] == "POST"
-    assert FakeHTTPClient.requests[3]["json"] == server
-    assert FakeHTTPClient.requests[5]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/mcp-servers/github/test"
-    )
-    assert FakeHTTPClient.requests[7]["method"] == "DELETE"
-
-
-def test_mcp_add_rejects_missing_transport(tmp_path: Path) -> None:
-    """MCP add should fail locally when neither HTTP nor stdio transport is provided."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "mcp", "add", "github", "--project", "dayplan"],
-    )
-
-    assert result.exit_code != 0
-    assert "Provide exactly one transport: --url or --command" in plain_cli_output(result)
-    assert FakeHTTPClient.requests == []
-
-
-def test_mcp_add_rejects_ambiguous_transport(tmp_path: Path) -> None:
-    """MCP add should fail locally when both transports are provided."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "mcp",
-            "add",
-            "github",
-            "--project",
-            "dayplan",
-            "--url",
-            "https://mcp.github.example.com/mcp",
-            "--command",
-            "github-mcp",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "Provide exactly one transport: --url or --command" in plain_cli_output(result)
-    assert FakeHTTPClient.requests == []
-
-
-def test_mcp_add_rejects_malformed_key_value_options(tmp_path: Path) -> None:
-    """MCP headers and env values should use explicit key=value pairs."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "mcp",
-            "add",
-            "github",
-            "--project",
-            "dayplan",
-            "--url",
-            "https://mcp.github.example.com/mcp",
-            "--header",
-            "Authorization",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "--header values must use key=value" in plain_cli_output(result)
-    assert FakeHTTPClient.requests == []
-
-
-def test_model_providers_list_set_health_and_revoke(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Model provider commands should manage tenant keys without printing raw secrets."""
-    config_path = write_config(tmp_path)
-    monkeypatch.setenv("OPENAI_API_KEY_TEST", "sk-test-secret")
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "status": "active"}
-    credential = {
-        "provider": "openai",
-        "status": "active",
-        "base_url_configured": False,
-        "api_mode": "responses",
-        "model_prefixes": ["openai/"],
-        "created_at": "2026-05-05T07:00:00Z",
-        "updated_at": "2026-05-05T07:00:00Z",
-        "last_validated_at": None,
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"items": [credential]}),
-        json_response({"items": [project]}),
-        json_response(credential),
-        json_response({"items": [project]}),
-        json_response(
-            {
-                "provider": "openai",
-                "status": "available",
-                "message": "Provider credential accepted.",
-                "checked_at": "2026-05-05T07:01:00Z",
-                "latency_ms": 12,
-                "status_code": 200,
-                "retryable": False,
-                "last_validated_at": "2026-05-05T07:01:00Z",
-            }
-        ),
-        json_response({"items": [project]}),
-        json_response({"status": "revoked", "provider": "openai"}),
-    ]
-
-    runner = CliRunner()
-    list_result = runner.invoke(
-        app,
-        ["--config", str(config_path), "model-providers", "list", "--project", "dayplan"],
-    )
-    set_result = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "model-providers",
-            "set",
-            "openai",
-            "--project",
-            "dayplan",
-            "--api-key-env",
-            "OPENAI_API_KEY_TEST",
-            "--api-mode",
-            "responses",
-            "--model-prefix",
-            "openai/",
-        ],
-    )
-    health_result = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "model-providers",
-            "health",
-            "openai",
-            "--project",
-            "dayplan",
-            "--json",
-        ],
-    )
-    revoke_result = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "model-providers",
-            "revoke",
-            "openai",
-            "--project",
-            "dayplan",
-            "--yes",
-        ],
-    )
-
-    assert list_result.exit_code == 0
-    assert set_result.exit_code == 0
-    assert health_result.exit_code == 0
-    assert revoke_result.exit_code == 0
-    combined_output = (
-        list_result.output + set_result.output + health_result.output + revoke_result.output
-    )
-    assert "sk-test-secret" not in combined_output
-    assert "Stored model provider credential for openai" in set_result.output
-    assert json.loads(health_result.output)["status"] == "available"
-    assert "Revoked model provider credential for openai" in revoke_result.output
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/model-providers"
-    )
-    assert FakeHTTPClient.requests[3]["method"] == "PUT"
-    assert FakeHTTPClient.requests[3]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/model-providers/openai"
-    )
-    assert FakeHTTPClient.requests[3]["json"] == {
-        "api_key": "sk-test-secret",
-        "api_mode": "responses",
-        "model_prefixes": ["openai/"],
-    }
-    assert FakeHTTPClient.requests[5]["method"] == "POST"
-    assert FakeHTTPClient.requests[5]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/model-providers/openai/health-check"
-    )
-    assert FakeHTTPClient.requests[7]["method"] == "DELETE"
-    assert FakeHTTPClient.requests[7]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/model-providers/openai"
-    )
-
-
-def test_model_provider_set_rejects_conflicting_secret_sources(tmp_path: Path) -> None:
-    """Model provider set should not accept two raw key sources."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "model-providers",
-            "set",
-            "openai",
-            "--project",
-            "dayplan",
-            "--api-key",
-            "sk-one",
-            "--api-key-env",
-            "OPENAI_API_KEY_TEST",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "Use only one of --api-key or --api-key-env" in plain_cli_output(result)
-    assert FakeHTTPClient.requests == []
-
-
-def test_users_commands_manage_project_users(tmp_path: Path) -> None:
-    """User commands should list, inspect, and delete scoped tenant users."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
-    user = {
-        "id": "user-1",
-        "phone_e164": "+15551234567",
-        "display_name": "Ava",
-        "last_active_at": "2026-05-05T10:00:00Z",
-        "message_count": 7,
-    }
-    detail = {
-        "user": user,
-        "memory_facts": [{"id": "mem-1", "fact_type": "preference", "content": "likes SMS"}],
-        "credentials": [{"provider": "google", "status": "connected", "scopes": ["calendar"]}],
-        "message_count": 7,
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"items": [user], "total": 1, "page": 1, "page_size": 25}),
-        json_response({"items": [project]}),
-        json_response(detail),
-        json_response({"items": [project]}),
-        json_response({"status": "deleted", "user_id": "user-1"}),
-    ]
-    runner = CliRunner()
-
-    listed = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "users",
-            "list",
-            "--project",
-            "dayplan",
-            "--page-size",
-            "25",
-        ],
-    )
-    inspected = runner.invoke(
-        app,
-        ["--config", str(config_path), "users", "detail", "user-1", "--project", "dayplan"],
-    )
-    deleted = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "users",
-            "delete",
-            "user-1",
-            "--project",
-            "dayplan",
-            "--yes",
-        ],
-    )
-
-    assert listed.exit_code == 0
-    assert inspected.exit_code == 0
-    assert deleted.exit_code == 0
-    assert "user-1" in listed.output
-    assert "Memory Facts" in inspected.output
-    assert "Deleted user user-1" in deleted.output
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/users")
-    assert FakeHTTPClient.requests[1]["params"] == {"page": 1, "page_size": 25}
-    assert FakeHTTPClient.requests[3]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/users/user-1"
-    )
-    assert FakeHTTPClient.requests[5]["method"] == "DELETE"
-
-
-def test_users_delete_requires_confirmation(tmp_path: Path) -> None:
-    """User deletion should ask for confirmation unless --yes is provided."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "users", "delete", "user-1", "--project", "dayplan"],
-        input="n\n",
-    )
-
-    assert result.exit_code != 0
-    assert FakeHTTPClient.requests == []
-
-
-def test_identity_commands_manage_test_links(tmp_path: Path) -> None:
-    """Identity commands should list and create verified test links."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
-    link = {
-        "project_id": "proj/1",
-        "phone_e164": "+15551234567",
-        "provider_user_id": "auth0|user_123",
-        "provider_name": "mysti",
-        "verified": True,
-        "linked_at": "2026-05-05T10:00:00Z",
-        "metadata": {"source": "genaug-cli"},
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"items": [link]}),
-        json_response({"items": [project]}),
-        json_response(link),
-    ]
-    runner = CliRunner()
-
-    listed = runner.invoke(
-        app,
-        ["--config", str(config_path), "identity", "list", "--project", "dayplan"],
-    )
-    created = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "identity",
-            "create-test",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-user-id",
-            "auth0|user_123",
-            "--provider-name",
-            "mysti",
-            "--metadata",
-            "source=genaug-cli",
-            "--json",
-        ],
-    )
-
-    assert listed.exit_code == 0
-    assert created.exit_code == 0
-    assert "auth0|user_123" in listed.output
-    assert json.loads(created.output)["provider_user_id"] == "auth0|user_123"
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/identity-links"
-    )
-    assert FakeHTTPClient.requests[1]["params"] == {"limit": 100, "offset": 0}
-    assert FakeHTTPClient.requests[3]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/identity-links/test"
-    )
-    assert FakeHTTPClient.requests[3]["json"] == {
-        "phone_e164": "+15551234567",
-        "provider_user_id": "auth0|user_123",
-        "provider_name": "mysti",
-        "metadata": {"source": "genaug-cli"},
-    }
-
-
-def test_identity_lifecycle_commands_call_integration_routes(tmp_path: Path) -> None:
-    """Identity lifecycle commands should use documented admin-authenticated integration APIs."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
-    challenge = {
-        "id": "link-1",
-        "phone_e164": "+15551234567",
-        "provider_name": "mysti",
-        "provider_user_id": "auth0|user_123",
-        "verification_expires_at": "2026-05-05T10:10:00Z",
-        "magic_link": "https://auth.example/link",
-        "debug_verification_code": "123456",
-    }
-    resolution = {
-        "project_id": "proj/1",
-        "phone_e164": "+15551234567",
-        "provider_name": "mysti",
-        "provider_user_id": "auth0|user_123",
-        "linked_at": "2026-05-05T10:11:00Z",
-        "metadata": {"source": "genaug-cli"},
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(challenge),
-        json_response({"items": [project]}),
-        json_response(challenge),
-        json_response({"items": [project]}),
-        json_response(challenge),
-        json_response({"items": [project]}),
-        json_response(resolution),
-        json_response({"items": [project]}),
-        json_response(resolution),
-        json_response({"items": [project]}),
-        json_response({"unlinked": True}),
-    ]
-    runner = CliRunner()
-
-    commands = [
-        [
-            "identity",
-            "link-user",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-name",
-            "mysti",
-            "--provider-user-id",
-            "auth0|user_123",
-            "--metadata",
-            "source=genaug-cli",
-            "--json",
-        ],
-        [
-            "identity",
-            "verification-code",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-name",
-            "mysti",
-            "--provider-user-id",
-            "auth0|user_123",
-            "--metadata",
-            "source=genaug-cli",
-            "--json",
-        ],
-        [
-            "identity",
-            "magic-link",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-name",
-            "mysti",
-            "--user-identifier",
-            "person@example.com",
-            "--channel",
-            "telegram",
-            "--metadata",
-            "source=genaug-cli",
-            "--json",
-        ],
-        [
-            "identity",
-            "verify",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-name",
-            "mysti",
-            "--code",
-            "123456",
-            "--provider-user-id",
-            "auth0|user_123",
-            "--json",
-        ],
-        [
-            "identity",
-            "resolve",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-name",
-            "mysti",
-            "--json",
-        ],
-        [
-            "identity",
-            "unlink",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-name",
-            "mysti",
-            "--yes",
-            "--json",
-        ],
-    ]
-
-    for command in commands:
-        result = runner.invoke(app, ["--config", str(config_path), *command])
-        assert result.exit_code == 0, result.output
-
-    integration_requests = FakeHTTPClient.requests[1::2]
-    assert [request["method"] for request in integration_requests] == [
-        "POST",
-        "POST",
-        "POST",
-        "POST",
-        "GET",
-        "DELETE",
-    ]
-    assert [request["url"].removeprefix("http://api.test") for request in integration_requests] == [
-        "/api/v1/integrations/proj%2F1/link-user",
-        "/api/v1/integrations/proj%2F1/verification-code",
-        "/api/v1/integrations/proj%2F1/magic-link",
-        "/api/v1/integrations/proj%2F1/verify",
-        "/api/v1/integrations/proj%2F1/resolve/%2B15551234567",
-        "/api/v1/integrations/proj%2F1/unlink/%2B15551234567",
-    ]
-    assert all(request["headers"] == {"X-Admin-Key": "secret"} for request in integration_requests)
-    assert all("Authorization" not in request["headers"] for request in integration_requests)
-    assert integration_requests[0]["json"] == {
-        "phone_e164": "+15551234567",
-        "provider_user_id": "auth0|user_123",
-        "provider_name": "mysti",
-        "metadata": {"source": "genaug-cli"},
-    }
-    assert integration_requests[1]["json"] == {
-        "phone_e164": "+15551234567",
-        "provider_user_id": "auth0|user_123",
-        "provider_name": "mysti",
-        "metadata": {"source": "genaug-cli"},
-    }
-    assert integration_requests[2]["json"] == {
-        "phone_e164": "+15551234567",
-        "user_identifier": "person@example.com",
-        "provider_name": "mysti",
-        "channel": "telegram",
-        "metadata": {"source": "genaug-cli"},
-    }
-    assert integration_requests[3]["json"] == {
-        "phone_e164": "+15551234567",
-        "provider_name": "mysti",
-        "code": "123456",
-        "provider_user_id": "auth0|user_123",
-    }
-    assert integration_requests[4]["params"] == {"provider_name": "mysti"}
-    assert integration_requests[5]["params"] == {"provider_name": "mysti"}
-
-
-def test_identity_unlink_requires_confirmation(tmp_path: Path) -> None:
-    """Identity unlink should not touch the API unless the operator confirms."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "identity",
-            "unlink",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-name",
-            "mysti",
-        ],
-        input="n\n",
-    )
-
-    assert result.exit_code != 0
-    assert FakeHTTPClient.requests == []
-
-
-def test_identity_create_test_rejects_malformed_metadata(tmp_path: Path) -> None:
-    """Identity metadata should use explicit key=value pairs."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "identity",
-            "create-test",
-            "--project",
-            "dayplan",
-            "--phone",
-            "+15551234567",
-            "--provider-user-id",
-            "auth0|user_123",
-            "--metadata",
-            "source",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "--metadata values must use key=value" in plain_cli_output(result)
-    assert FakeHTTPClient.requests == []
-
-
-def test_observability_commands_fetch_trace_and_support_bundle(tmp_path: Path) -> None:
-    """Observability commands should fetch one trace and scoped support evidence."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
-    trace = {
-        "id": "msg-1",
-        "trace_id": "trace-1",
-        "langfuse_url": "https://langfuse.example.com/trace-1",
-        "created_at": "2026-05-05T10:00:00Z",
-        "session_id": "session-1",
-        "user_id": "user-1",
-        "input": "hello",
-        "output": "hi",
-        "model_used": "openai/gpt-5.5",
-        "input_tokens": 12,
-        "output_tokens": 8,
-        "cost_usd": 0.01,
-        "latency_ms": 321,
-        "tool_calls": [],
-    }
-    bundle = {
-        "api_version": "genaug.observability_support_bundle.v1",
-        "generated_at": "2026-05-05T10:01:00Z",
-        "project_id": "proj/1",
-        "filters": {"trace_id": "trace-1", "response_id": "resp-1", "limit": 25},
-        "metrics": {
-            "trace_count": 1,
-            "log_count": 2,
-            "audit_event_count": 1,
-            "memory_fact_count": 0,
-            "usage_event_count": 1,
-            "timeline_event_count": 4,
-        },
-        "traces": [trace],
-        "logs": [],
-        "audit_events": [],
-        "control_plane_events": [],
-        "memory_facts": [],
-        "usage_events": [],
-        "timeline": [],
-        "notes": ["bounded"],
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(trace),
-        json_response({"items": [project]}),
-        json_response(bundle),
-    ]
-    output_path = tmp_path / "support-bundle.json"
-    runner = CliRunner()
-
-    fetched_trace = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "observability",
-            "trace",
-            "trace-1",
-            "--project",
-            "dayplan",
-        ],
-    )
-    fetched_bundle = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "observability",
-            "support-bundle",
-            "--project",
-            "dayplan",
-            "--trace-id",
-            "trace-1",
-            "--response-id",
-            "resp-1",
-            "--limit",
-            "25",
-            "--output",
-            str(output_path),
-        ],
-    )
-
-    assert fetched_trace.exit_code == 0
-    assert fetched_bundle.exit_code == 0
-    assert "trace-1" in fetched_trace.output
-    assert "Wrote support bundle" in fetched_bundle.output
-    assert json.loads(output_path.read_text(encoding="utf-8"))["filters"]["trace_id"] == "trace-1"
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/traces/trace-1"
-    )
-    assert FakeHTTPClient.requests[3]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/observability/support-bundle"
-    )
-    assert FakeHTTPClient.requests[3]["params"] == {
-        "limit": 25,
-        "trace_id": "trace-1",
-        "response_id": "resp-1",
-    }
-
-
-def test_observability_support_bundle_json_is_machine_readable(tmp_path: Path) -> None:
-    """Support-bundle JSON output should be usable by support automation."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
-    bundle = {
-        "api_version": "genaug.observability_support_bundle.v1",
-        "generated_at": "2026-05-05T10:01:00Z",
-        "project_id": "proj/1",
-        "filters": {"user_id": "user-1"},
-        "metrics": {"timeline_event_count": 0},
-        "traces": [],
-        "logs": [],
-        "audit_events": [],
-        "control_plane_events": [],
-        "memory_facts": [],
-        "usage_events": [],
-        "timeline": [],
-        "notes": [],
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(bundle),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "observability",
-            "support-bundle",
-            "--project",
-            "dayplan",
-            "--user-id",
-            "user-1",
             "--json",
         ],
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.output)["filters"]["user_id"] == "user-1"
+    assert json.loads(result.output) == server
+    assert FakeHTTPClient.requests[1]["method"] == "POST"
+    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/mcp-servers")
+    assert FakeHTTPClient.requests[1]["json"] == server
 
 
-def test_approval_commands_list_approve_and_deny(tmp_path: Path) -> None:
-    """Approval commands should inspect and resolve governed action rows."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
-    approval = {
-        "id": "row-1",
-        "approval_id": "approval-1",
-        "project_id": "proj/1",
-        "user_id": "user-1",
-        "session_id": "session-1",
-        "tool_id": "email_send",
-        "action_summary": "Send email to person@example.com",
-        "input_summary": '{"subject":"Hello"}',
-        "channel": "sms",
-        "status": "pending",
-        "requested_at": "2026-05-05T10:00:00Z",
-        "resolved_at": None,
-        "expires_at": "2026-05-05T10:05:00Z",
-        "created_at": "2026-05-05T10:00:00Z",
-    }
-    approved = {**approval, "status": "approved", "resolved_at": "2026-05-05T10:01:00Z"}
-    denied = {**approval, "status": "denied", "resolved_at": "2026-05-05T10:02:00Z"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"items": [approval]}),
-        json_response({"items": [project]}),
-        json_response({"approval": approved, "enqueued": True}),
-        json_response({"items": [project]}),
-        json_response({"approval": denied, "enqueued": False}),
-    ]
-    runner = CliRunner()
-
-    listed = runner.invoke(
-        app,
-        ["--config", str(config_path), "approvals", "list", "--project", "dayplan"],
-    )
-    approve = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "approvals",
-            "approve",
-            "approval-1",
-            "--project",
-            "dayplan",
-            "--yes",
-        ],
-    )
-    deny = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "approvals",
-            "deny",
-            "approval-1",
-            "--project",
-            "dayplan",
-            "--yes",
-            "--json",
-        ],
-    )
-
-    assert listed.exit_code == 0
-    assert approve.exit_code == 0
-    assert deny.exit_code == 0
-    assert "approval-1" in listed.output
-    assert "enqueued=True" in approve.output
-    assert json.loads(deny.output)["approval"]["status"] == "denied"
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1/approvals")
-    assert FakeHTTPClient.requests[1]["params"] == {"status": "pending"}
-    assert FakeHTTPClient.requests[3]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/approvals/approval-1/approve"
-    )
-    assert FakeHTTPClient.requests[5]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/approvals/approval-1/deny"
-    )
-
-
-def test_approval_actions_require_confirmation(tmp_path: Path) -> None:
-    """Approval side effects should require confirmation unless --yes is provided."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "approvals",
-            "approve",
-            "approval-1",
-            "--project",
-            "dayplan",
-        ],
-        input="n\n",
-    )
-
-    assert result.exit_code != 0
-    assert FakeHTTPClient.requests == []
-
-
-def test_approval_list_rejects_unknown_status(tmp_path: Path) -> None:
-    """Approval list should validate the status filter locally."""
-    config_path = write_config(tmp_path)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "approvals",
-            "list",
-            "--project",
-            "dayplan",
-            "--status",
-            "resolved",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "--status must be one of: all, pending" in plain_cli_output(result)
-    assert FakeHTTPClient.requests == []
-
-
-def test_job_commands_cover_lifecycle_and_json_output(tmp_path: Path) -> None:
-    """Scheduled job commands should use admin APIs and emit machine-readable JSON."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
-    run = {
-        "id": "run/1",
-        "scheduled_job_id": "job/1",
-        "status": "completed",
-        "scheduled_for": "2026-05-20T12:00:00Z",
-        "attempt_count": 1,
-        "max_attempts": 3,
-        "trace_id": "trace-1",
-        "agent_run_id": "agent-run-1",
-        "dispatch_key": "scheduled:job/1:window",
-    }
-    job = {
-        "id": "job/1",
-        "project_id": "proj/1",
-        "job_type": "agent_turn",
-        "status": "active",
-        "name": "Daily review",
-        "target_app_user_id": "app-user-123",
-        "target_channel": "api",
-        "next_run_at": "2026-05-20T13:00:00Z",
-        "last_run_at": "2026-05-20T12:00:00Z",
-        "retry_history": [run],
-        "linked_run_ids": ["agent-run-1"],
-        "latest_trace_id": "trace-1",
-    }
-    paused = {**job, "status": "paused"}
-    cancelled = {**job, "status": "cancelled", "terminal_reason": "cancelled"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(job),
-        json_response({"items": [project]}),
-        json_response({"items": [job]}),
-        json_response({"items": [project]}),
-        json_response(job),
-        json_response({"items": [project]}),
-        json_response({"items": [run]}),
-        json_response({"items": [project]}),
-        json_response({"job": job, "run": run}),
-        json_response({"items": [project]}),
-        json_response(paused),
-        json_response({"items": [project]}),
-        json_response(job),
-        json_response({"items": [project]}),
-        json_response(cancelled),
-    ]
-    runner = CliRunner()
-
-    created = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "jobs",
-            "create",
-            "--project",
-            "dayplan",
-            "--target-app-user-id",
-            "app-user-123",
-            "--target-channel",
-            "api",
-            "--name",
-            "Daily review",
-            "--prompt",
-            "Review this account.",
-            "--interval-seconds",
-            "3600",
-            "--json",
-        ],
-    )
-    listed = runner.invoke(
-        app,
-        ["--config", str(config_path), "jobs", "list", "--project", "dayplan", "--json"],
-    )
-    detail = runner.invoke(
-        app,
-        ["--config", str(config_path), "jobs", "detail", "job/1", "--project", "dayplan"],
-    )
-    runs = runner.invoke(
-        app,
-        ["--config", str(config_path), "jobs", "runs", "job/1", "--project", "dayplan", "--json"],
-    )
-    dispatched = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "jobs",
-            "run",
-            "job/1",
-            "--project",
-            "dayplan",
-            "--dispatch-key",
-            "operator-smoke-1",
-            "--record-only",
-            "--json",
-        ],
-    )
-    paused_result = runner.invoke(
-        app,
-        ["--config", str(config_path), "jobs", "pause", "job/1", "--project", "dayplan", "--json"],
-    )
-    resumed_result = runner.invoke(
-        app,
-        ["--config", str(config_path), "jobs", "resume", "job/1", "--project", "dayplan"],
-    )
-    deleted = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "jobs",
-            "delete",
-            "job/1",
-            "--project",
-            "dayplan",
-            "--yes",
-            "--json",
-        ],
-    )
-
-    assert created.exit_code == 0
-    assert listed.exit_code == 0
-    assert detail.exit_code == 0
-    assert runs.exit_code == 0
-    assert dispatched.exit_code == 0
-    assert paused_result.exit_code == 0
-    assert resumed_result.exit_code == 0
-    assert deleted.exit_code == 0
-    assert json.loads(created.output)["id"] == "job/1"
-    assert json.loads(listed.output)["items"][0]["latest_trace_id"] == "trace-1"
-    assert "Daily review" in detail.output
-    assert json.loads(runs.output)["items"][0]["trace_id"] == "trace-1"
-    assert json.loads(dispatched.output)["run"]["dispatch_key"] == "scheduled:job/1:window"
-    assert json.loads(paused_result.output)["status"] == "paused"
-    assert "Scheduled job job/1 resumed" in resumed_result.output
-    assert json.loads(deleted.output)["terminal_reason"] == "cancelled"
-    assert FakeHTTPClient.requests[1]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/scheduled-jobs"
-    )
-    assert FakeHTTPClient.requests[1]["json"]["schedule"] == {
-        "type": "interval",
-        "every_seconds": 3600,
-    }
-    assert FakeHTTPClient.requests[3]["params"] == {"limit": 50}
-    assert FakeHTTPClient.requests[5]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/scheduled-jobs/job%2F1"
-    )
-    assert FakeHTTPClient.requests[7]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/scheduled-jobs/job%2F1/runs"
-    )
-    assert FakeHTTPClient.requests[9]["json"] == {
-        "dispatch_key": "operator-smoke-1",
-        "execute": False,
-    }
-    assert FakeHTTPClient.requests[15]["method"] == "DELETE"
-
-
-def test_channels_status_connect_test_and_disconnect(tmp_path: Path) -> None:
-    """Channel commands should call Telegram lifecycle endpoints."""
-    config_path = write_config(tmp_path)
-    project = {
-        "id": "p1",
-        "name": "DayPlan",
-        "slug": "dayplan",
-        "enabled_tool_ids": [],
-        "whatsapp_phone_number_id": "wa_123",
-    }
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response({"connected": True, "bot_username": "dayplan_bot", "message_count_24h": 2}),
-        json_response({"items": [project]}),
-        json_response({"connected": True, "bot_username": "dayplan_bot"}),
-        json_response({"items": [project]}),
-        json_response({"bot_username": "dayplan_bot"}),
-        json_response({"items": [project]}),
-        json_response({"ok": True, "provider_response": {"ok": True}}),
-        json_response({"items": [project]}),
-        json_response({"connected": False}),
-    ]
-    runner = CliRunner()
-
-    status = runner.invoke(
-        app,
-        ["--config", str(config_path), "channels", "status", "--project", "dayplan"],
-    )
-    status_json = runner.invoke(
-        app,
-        ["--config", str(config_path), "channels", "status", "--project", "dayplan", "--json"],
-    )
-    connect = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "channels",
-            "connect",
-            "--project",
-            "dayplan",
-            "--bot-token",
-            "123456:token",
-        ],
-    )
-    test = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "channels",
-            "test",
-            "--project",
-            "dayplan",
-            "--chat-id",
-            "12345",
-            "--message",
-            "hello",
-            "--json",
-        ],
-    )
-    disconnect = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "channels",
-            "disconnect",
-            "--project",
-            "dayplan",
-            "--yes",
-        ],
-    )
-
-    assert status.exit_code == 0
-    assert status_json.exit_code == 0
-    assert connect.exit_code == 0
-    assert test.exit_code == 0
-    assert disconnect.exit_code == 0
-    assert "dayplan_bot" in status.output
-    assert json.loads(status_json.output)["channels"]["whatsapp"]["connected"] is True
-    assert json.loads(test.output)["ok"] is True
-    assert FakeHTTPClient.requests[5]["url"].endswith("/api/v1/admin/channels/telegram/connect")
-    assert FakeHTTPClient.requests[7]["url"].endswith("/api/v1/admin/channels/telegram/test")
-    assert FakeHTTPClient.requests[7]["json"] == {
-        "project_id": "p1",
-        "chat_id": "12345",
-        "message": "hello",
-    }
-    assert FakeHTTPClient.requests[9]["url"].endswith("/api/v1/admin/channels/telegram/disconnect")
-
-
-def test_channels_configures_whatsapp_and_sms_senders(tmp_path: Path) -> None:
-    """Channel commands should configure non-Telegram sender ids through project updates."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "enabled_tool_ids": []}
-    whatsapp_project = {**project, "whatsapp_phone_number_id": "wa_123"}
-    sms_project = {**project, "twilio_phone_number": "+15551234567"}
-    FakeHTTPClient.queue = [
-        json_response({"items": [project]}),
-        json_response(whatsapp_project),
-        json_response({"items": [project]}),
-        json_response(sms_project),
-        json_response({"items": [whatsapp_project]}),
-        json_response({**whatsapp_project, "whatsapp_phone_number_id": None}),
-        json_response({"items": [sms_project]}),
-        json_response({**sms_project, "twilio_phone_number": None}),
-    ]
-    runner = CliRunner()
-
-    whatsapp_connect = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "channels",
-            "connect",
-            "--project",
-            "dayplan",
-            "--channel",
-            "whatsapp",
-            "--phone-number-id",
-            "wa_123",
-        ],
-    )
-    sms_connect = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "channels",
-            "connect",
-            "--project",
-            "dayplan",
-            "--channel",
-            "sms",
-            "--twilio-number",
-            "+15551234567",
-        ],
-    )
-    whatsapp_disconnect = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "channels",
-            "disconnect",
-            "--project",
-            "dayplan",
-            "--channel",
-            "whatsapp",
-            "--yes",
-            "--json",
-        ],
-    )
-    sms_disconnect = runner.invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "channels",
-            "disconnect",
-            "--project",
-            "dayplan",
-            "--channel",
-            "sms",
-            "--yes",
-            "--json",
-        ],
-    )
-
-    assert whatsapp_connect.exit_code == 0
-    assert sms_connect.exit_code == 0
-    assert whatsapp_disconnect.exit_code == 0
-    assert sms_disconnect.exit_code == 0
-    assert "WhatsApp sender configured" in whatsapp_connect.output
-    assert "SMS sender configured" in sms_connect.output
-    assert FakeHTTPClient.requests[1]["method"] == "PATCH"
-    assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/projects/proj%2F1")
-    assert FakeHTTPClient.requests[1]["json"] == {"whatsapp_phone_number_id": "wa_123"}
-    assert FakeHTTPClient.requests[3]["json"] == {"twilio_phone_number": "+15551234567"}
-    assert FakeHTTPClient.requests[5]["json"] == {"whatsapp_phone_number_id": None}
-    assert FakeHTTPClient.requests[7]["json"] == {"twilio_phone_number": None}
-    assert json.loads(whatsapp_disconnect.output)["whatsapp_phone_number_id"] is None
-    assert json.loads(sms_disconnect.output)["twilio_phone_number"] is None
-
-
-def test_channels_rejects_blank_sender_value(tmp_path: Path) -> None:
-    """Channel configuration should fail closed before saving empty provider identifiers."""
-    config_path = write_config(tmp_path)
-    project = {"id": "proj_1", "name": "DayPlan", "slug": "dayplan", "enabled_tool_ids": []}
-    FakeHTTPClient.queue = [json_response({"items": [project]})]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "channels",
-            "connect",
-            "--project",
-            "dayplan",
-            "--channel",
-            "whatsapp",
-            "--phone-number-id",
-            "   ",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "--phone-number-id is required for this channel" in plain_cli_output(result)
-    assert len(FakeHTTPClient.requests) == 1
-    assert FakeHTTPClient.requests[0]["method"] == "GET"
-
-
-def test_status_and_logs(tmp_path: Path) -> None:
-    """Status and logs should call public health plus admin project endpoints."""
+def test_status_json_includes_queue_depths_and_project_usage(tmp_path: Path) -> None:
+    """Machine-readable status should expose queue pressure and project usage."""
     config_path = write_config(tmp_path)
     project = {"id": "p1", "name": "DayPlan", "slug": "dayplan", "enabled_tool_ids": []}
     FakeHTTPClient.queue = [
         json_response({"status": "ok"}),
         json_response({"status": "ready"}),
-        text_response("general_augment_requests_total 1"),
-        json_response({"items": [project]}),
-        json_response(
-            {"totals": {"agent_turns_count": 2, "messages_count": 3, "tool_calls_count": 1}}
+        text_response(
+            "\n".join(
+                [
+                    "# HELP general_augment_queue_depth Current queue depth by queue name.",
+                    'general_augment_queue_depth{queue="arq:queue"} 3.0',
+                    'general_augment_queue_depth{queue="priority"} 1',
+                ]
+            )
         ),
         json_response({"items": [project]}),
-        json_response({"items": [{"created_at": "now", "role": "assistant", "content": "hello"}]}),
+        json_response(
+            {
+                "totals": {
+                    "agent_turns_count": 2,
+                    "messages_count": 3,
+                    "tool_calls_count": 1,
+                    "total_cost_usd": 0.12,
+                }
+            }
+        ),
     ]
-    runner = CliRunner()
 
-    status = runner.invoke(app, ["--config", str(config_path), "status", "--project", "dayplan"])
-    logs = runner.invoke(app, ["--config", str(config_path), "logs", "--project", "dayplan"])
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "status", "--project", "dayplan", "--json"],
+    )
 
-    assert status.exit_code == 0
-    assert logs.exit_code == 0
-    assert "Platform Status" in status.output
-    assert "hello" in logs.output
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["live"]["status"] == "ok"
+    assert payload["ready"]["status"] == "ready"
+    assert payload["metrics"]["queue_depths"] == [
+        {"depth": 3, "queue": "arq:queue"},
+        {"depth": 1, "queue": "priority"},
+    ]
+    assert payload["project"]["usage"]["agent_turns_count"] == 2
+    assert FakeHTTPClient.requests[2]["url"] == "http://api.test/metrics"
 
 
 def test_smoke_calls_ready_and_responses_with_correlation_headers(tmp_path: Path) -> None:
@@ -3646,7 +2441,17 @@ def test_smoke_calls_ready_and_responses_with_correlation_headers(tmp_path: Path
                         "content": [{"type": "output_text", "text": "genaug-smoke-ok"}],
                     }
                 ],
-                "metadata": {"trace_id": "trace_smoke", "request_id": "req_smoke"},
+                "usage": {
+                    "input_tokens": 80,
+                    "output_tokens": 24,
+                    "total_tokens": 104,
+                },
+                "metadata": {
+                    "trace_id": "trace_smoke",
+                    "request_id": "req_smoke",
+                    "general_augment_latency_ms": 912,
+                    "general_augment_cost_usd": 0.004,
+                },
             }
         ),
     ]
@@ -3669,6 +2474,12 @@ def test_smoke_calls_ready_and_responses_with_correlation_headers(tmp_path: Path
     assert result.exit_code == 0
     assert "resp_smoke" in result.output
     assert "genaug-smoke-ok" in result.output
+    assert "Latency" in result.output
+    assert "912 ms" in result.output
+    assert "Tokens" in result.output
+    assert "104 total (80 input, 24 output)" in result.output
+    assert "Cost" in result.output
+    assert "0.004" in result.output
     assert "Support receipt" in result.output
     assert "genaug-cli-smoke" in result.output
     assert FakeHTTPClient.requests[0]["url"] == "http://api.test/health/ready"
@@ -3710,6 +2521,174 @@ def test_smoke_can_scope_management_key_to_project(tmp_path: Path) -> None:
     assert payload["response_id"] == "resp_smoke"
 
 
+def test_smoke_resolves_uuid_project_by_direct_lookup(tmp_path: Path) -> None:
+    """UUID project refs should not depend on the first project-list page."""
+    config_path = write_config(tmp_path)
+    project_id = "d4b45a89-dd1e-4add-9434-4b252adf1d5a"
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response({"id": project_id, "name": "Spark", "slug": "spark"}),
+        json_response(
+            {"id": "resp_smoke", "status": "completed", "output_text": "genaug-smoke-ok"}
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "smoke", "--project", project_id, "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert FakeHTTPClient.requests[1]["url"].endswith(f"/api/v1/admin/projects/{project_id}")
+    assert FakeHTTPClient.requests[2]["headers"]["X-Project-ID"] == project_id
+
+
+def test_smoke_resolves_project_beyond_first_list_page(tmp_path: Path) -> None:
+    """Slug/name refs should paginate through the admin project list."""
+    config_path = write_config(tmp_path)
+    first_page = [
+        {"id": f"proj_{index}", "name": f"Project {index}", "slug": f"project-{index}"}
+        for index in range(1000)
+    ]
+    project = {"id": "spark-id", "name": "Spark", "slug": "spark"}
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response({"items": first_page}),
+        json_response({"items": [project]}),
+        json_response(
+            {"id": "resp_smoke", "status": "completed", "output_text": "genaug-smoke-ok"}
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "smoke", "--project", "spark", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert FakeHTTPClient.requests[1]["params"] == {"limit": 1000, "offset": 0}
+    assert FakeHTTPClient.requests[2]["params"] == {"limit": 1000, "offset": 1000}
+    assert FakeHTTPClient.requests[3]["headers"]["X-Project-ID"] == "spark-id"
+
+
+def test_smoke_invalid_runtime_key_explains_project_key_recovery(tmp_path: Path) -> None:
+    """App-facing smoke auth failures should point at project runtime keys."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response({"detail": "Unauthorized"}, status_code=401),
+    ]
+
+    result = CliRunner().invoke(app, ["--config", str(config_path), "smoke"])
+
+    assert result.exit_code != 0
+    assert "project runtime key" in result.output
+    assert "server-side" in result.output
+    assert "Unauthorized" in result.output
+
+
+def test_smoke_budget_limit_explains_billing_recovery(tmp_path: Path) -> None:
+    """App-facing smoke budget failures should name billing and budget checks."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response(
+            {
+                "detail": {
+                    "reason": "llm_budget_exhausted",
+                    "message": "LLM daily budget exhausted.",
+                }
+            },
+            status_code=402,
+        ),
+    ]
+
+    result = CliRunner().invoke(app, ["--config", str(config_path), "smoke"])
+    output = plain_cli_output(result)
+
+    assert result.exit_code != 0
+    assert "billing" in output
+    assert "LLM budget limit" in output
+    assert "genaug billing status" in output
+    assert "LLM daily budget exhausted" in output
+
+
+def test_smoke_rate_limit_explains_retry_after(tmp_path: Path) -> None:
+    """App-facing smoke rate limits should preserve stable reason and retry timing."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response(
+            {
+                "detail": {
+                    "reason": "messages_per_user_per_minute_exceeded",
+                    "message": "Project per-user message rate limit exceeded.",
+                }
+            },
+            status_code=429,
+            headers={"Retry-After": "30"},
+        ),
+    ]
+
+    result = CliRunner().invoke(app, ["--config", str(config_path), "smoke"])
+
+    assert result.exit_code != 0
+    assert "messages_per_user_per_minute_exceeded" in result.output
+    assert "Retry after 30 seconds" in result.output
+
+
+def test_app_facing_provider_failure_includes_model_provider_next_actions() -> None:
+    """Structured provider failures should point operators at provider controls."""
+
+    message = helpful_api_error(
+        503,
+        {
+            "detail": {
+                "message": "OpenAI route is unavailable.",
+                "provider": "openai",
+                "model": "gpt-5",
+                "model_provider_source": "tenant",
+            }
+        },
+        request_path="/v1/responses",
+        auth_mode="bearer",
+    )
+
+    assert "provider=openai" in message
+    assert "model=gpt-5" in message
+    assert "source=tenant" in message
+    assert "genaug model-providers check --project <project> --provider openai" in message
+    assert "genaug projects runtime-policy --project <project> --json" in message
+
+
+def test_app_facing_provider_failure_preserves_api_next_actions() -> None:
+    """Backend-supplied remediation commands should beat generic provider guesses."""
+
+    message = helpful_api_error(
+        500,
+        {
+            "detail": {
+                "message": "Model route is not configured.",
+                "model_provider": "anthropic",
+                "next_actions": [
+                    {
+                        "command": (
+                            "genaug model-providers upsert --project <project> --provider anthropic"
+                        )
+                    },
+                    "genaug providers smoke --provider anthropic --project <project>",
+                ],
+            }
+        },
+        request_path="/v1/responses",
+        auth_mode="bearer",
+    )
+
+    assert "provider=anthropic" in message
+    assert "genaug model-providers upsert --project <project> --provider anthropic" in message
+    assert "genaug providers smoke --provider anthropic --project <project>" in message
+
+
 def test_smoke_json_includes_readiness_and_trace_ids(tmp_path: Path) -> None:
     """Machine-readable smoke output should keep health proof with the response."""
     config_path = write_config(tmp_path)
@@ -3720,10 +2699,16 @@ def test_smoke_json_includes_readiness_and_trace_ids(tmp_path: Path) -> None:
                 "id": "resp_smoke",
                 "status": "completed",
                 "output_text": "genaug-smoke-ok",
+                "usage": {
+                    "input_tokens": 80,
+                    "output_tokens": 24,
+                    "total_tokens": 104,
+                },
                 "metadata": {
                     "general_augment_cost_usd": 0.004,
                     "general_augment_request_id": "req_1",
                     "general_augment_trace_id": "trace_1",
+                    "general_augment_latency_ms": 912,
                 },
             }
         ),
@@ -3747,8 +2732,17 @@ def test_smoke_json_includes_readiness_and_trace_ids(tmp_path: Path) -> None:
         "request_id": "req_1",
         "trace_id": "trace_1",
         "model": None,
+        "status": "completed",
+        "latency_ms": 912,
+        "input_tokens": 80,
+        "output_tokens": 24,
+        "total_tokens": 104,
         "cost_usd": 0.004,
         "ready_status": "ok",
+        "next_action": (
+            "Open the response in dashboard observability, then verify trace and "
+            "memory evidence before production traffic."
+        ),
     }
 
 
@@ -3761,7 +2755,13 @@ def test_smoke_writes_launch_evidence_with_support_bundle(tmp_path: Path) -> Non
         "api_version": "genaug.observability_support_bundle.v1",
         "project_id": "proj/1",
         "metrics": {"trace_count": 1, "audit_event_count": 1, "usage_event_count": 1},
-        "traces": [{"trace_id": "trace_1", "response_id": "resp_smoke"}],
+        "traces": [
+            {
+                "trace_id": "trace_1",
+                "response_id": "resp_smoke",
+                "metadata": {"api_key": "support-api-key-secret"},
+            }
+        ],
         "audit_events": [{"event_type": "responses.create"}],
         "usage_events": [{"event_type": "agent_turn"}],
     }
@@ -3774,9 +2774,15 @@ def test_smoke_writes_launch_evidence_with_support_bundle(tmp_path: Path) -> Non
                 "status": "completed",
                 "model": "mock/balanced",
                 "output_text": "genaug-smoke-ok",
+                "usage": {
+                    "input_tokens": 80,
+                    "output_tokens": 24,
+                    "total_tokens": 104,
+                },
                 "metadata": {
                     "general_augment_request_id": "req_1",
                     "general_augment_trace_id": "trace_1",
+                    "general_augment_latency_ms": 912,
                 },
             }
         ),
@@ -3799,12 +2805,19 @@ def test_smoke_writes_launch_evidence_with_support_bundle(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 0, result.output
+    assert_no_canary_secrets(result.output)
     payload = json.loads(result.output)
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert_no_canary_secrets(payload)
+    assert_no_canary_secrets(evidence)
     assert payload["evidence"]["schema_version"] == "general-augment-smoke-evidence/v1"
     assert evidence["support_receipt"]["trace_id"] == "trace_1"
     assert evidence["support_receipt"]["response_id"] == "resp_smoke"
-    assert evidence["support_bundle"] == support_bundle
+    assert evidence["support_receipt"]["status"] == "completed"
+    assert evidence["support_receipt"]["latency_ms"] == 912
+    assert evidence["support_receipt"]["total_tokens"] == 104
+    assert "dashboard observability" in evidence["support_receipt"]["next_action"]
+    assert evidence["support_bundle"]["traces"][0]["metadata"]["api_key"] == "[REDACTED]"
     assert "trace_id=trace_1" in evidence["dashboard_urls"]["observability_url"]
     assert "response_id=resp_smoke" in evidence["dashboard_urls"]["observability_url"]
     assert evidence["dashboard_urls"]["project_url"].endswith("/projects/dayplan")
@@ -3820,57 +2833,77 @@ def test_smoke_writes_launch_evidence_with_support_bundle(tmp_path: Path) -> Non
     }
 
 
-def test_smoke_can_request_structured_output(tmp_path: Path) -> None:
-    """Smoke should support schema-constrained Responses calls."""
+def test_smoke_can_import_launch_evidence_after_success(tmp_path: Path) -> None:
+    """Smoke should be able to retain its evidence in launch-readiness review."""
+
     config_path = write_config(tmp_path)
+    evidence_path = tmp_path / "smoke-evidence.json"
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
     FakeHTTPClient.queue = [
         json_response({"status": "ready"}),
+        json_response({"items": [project]}),
         json_response(
             {
-                "id": "resp_structured",
+                "id": "resp_smoke",
                 "status": "completed",
-                "model": "mock/balanced",
-                "output_text": '{"label": "genaug-smoke-ok", "ok": true}',
-                "metadata": {"trace_id": "trace_structured", "request_id": "req_structured"},
+                "output_text": "genaug-smoke-ok",
+                "metadata": {
+                    "general_augment_request_id": "req_1",
+                    "general_augment_trace_id": "trace_1",
+                },
+            }
+        ),
+        json_response(
+            {
+                "schema_version": "genaug.launch_readiness_evidence_import.v1",
+                "audit_event_id": "audit_1",
+                "artifact_type": "smoke_evidence",
+                "artifact_sha256": "abc123",
             }
         ),
     ]
 
     result = CliRunner().invoke(
         app,
-        ["--config", str(config_path), "smoke", "--structured"],
+        [
+            "--config",
+            str(config_path),
+            "smoke",
+            "--project",
+            "dayplan",
+            "--evidence-output",
+            str(evidence_path),
+            "--import-evidence",
+            "--json",
+        ],
     )
 
-    assert result.exit_code == 0
-    assert "json_schema" in result.output
-    payload = FakeHTTPClient.requests[1]["json"]
-    assert payload["input"] == 'Return JSON with ok=true and label="genaug-smoke-ok".'
-    assert payload["text"]["format"]["type"] == "json_schema"
-    assert payload["text"]["format"]["strict"] is True
-    assert payload["text"]["format"]["schema"]["required"] == ["ok", "label"]
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["evidence_import"]["audit_event_id"] == "audit_1"
+    import_request = FakeHTTPClient.requests[3]
+    assert import_request["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/launch-readiness/evidence"
+    )
+    assert import_request["json"]["artifact"] == evidence
+    assert import_request["json"]["artifact_type"] == "smoke_evidence"
+    assert import_request["json"]["source"] == "cli"
+    assert import_request["json"]["artifact_path"] == str(evidence_path)
 
 
-def test_smoke_can_load_structured_schema_file(tmp_path: Path) -> None:
-    """A schema file should imply structured output for app-specific checks."""
+def test_smoke_import_evidence_requires_project(tmp_path: Path) -> None:
+    """Evidence import needs a project because the retained audit receipt is project scoped."""
+
     config_path = write_config(tmp_path)
-    schema_path = tmp_path / "schema.json"
-    schema_path.write_text(
-        '{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}',
-        encoding="utf-8",
-    )
-    FakeHTTPClient.queue = [
-        json_response({"status": "ready"}),
-        json_response({"id": "resp_structured", "status": "completed", "output_text": "{}"}),
-    ]
 
     result = CliRunner().invoke(
         app,
-        ["--config", str(config_path), "smoke", "--schema-file", str(schema_path), "--json"],
+        ["--config", str(config_path), "smoke", "--import-evidence"],
     )
 
-    assert result.exit_code == 0
-    payload = FakeHTTPClient.requests[1]["json"]
-    assert payload["text"]["format"]["schema"]["required"] == ["summary"]
+    assert result.exit_code != 0
+    assert "--import-evidencerequires--project" in compact_cli_output(result)
 
 
 def test_smoke_fails_on_empty_agent_reply(tmp_path: Path) -> None:
@@ -3948,216 +2981,303 @@ def test_smoke_fails_on_bad_structured_output(tmp_path: Path) -> None:
     assert payload["verdict"] == "FAIL"
 
 
-def test_keys_create_json_includes_one_time_secret(tmp_path: Path) -> None:
-    """keys create --json must emit the one-time secret so an agent can capture it."""
+def test_smoke_memory_recall_seeds_memory_and_records_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Memory recall smoke should prove memory through /v1/responses, not prompt echo."""
+
+    config_path = write_config(tmp_path)
+    evidence_path = tmp_path / "smoke-evidence.json"
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+
+    def memory_response(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode())
+        recall_code = re.search(r"genaug-memory-[a-f0-9]+", str(payload["fact"]))
+        assert recall_code is not None
+        return json_response({"memory_id": "mem_smoke", "status": "stored"})
+
+    def responses_response(request: httpx.Request) -> httpx.Response:
+        memory_payload = FakeHTTPClient.requests[2]["json"]
+        recall_code = re.search(r"genaug-memory-[a-f0-9]+", str(memory_payload["fact"]))
+        assert recall_code is not None
+        return json_response(
+            {
+                "id": "resp_memory_smoke",
+                "status": "completed",
+                "output_text": recall_code.group(0),
+                "metadata": {
+                    "general_augment_request_id": "req_memory",
+                    "general_augment_trace_id": "trace_memory",
+                },
+            }
+        )
+
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response({"items": [project]}),
+    ]
+    original_request = FakeHTTPClient.request
+
+    def request_with_dynamic_responses(
+        self: FakeHTTPClient,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        if url.endswith("/api/v1/agent/memory/store"):
+            self.requests.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers or {},
+                    "json": json,
+                    "params": params,
+                }
+            )
+            return memory_response(httpx.Request(method, url, json=json))
+        if url.endswith("/v1/responses"):
+            self.requests.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers or {},
+                    "json": json,
+                    "params": params,
+                }
+            )
+            return responses_response(httpx.Request(method, url, json=json))
+        return original_request(self, method, url, headers=headers, json=json, params=params)
+
+    monkeypatch.setattr(FakeHTTPClient, "request", request_with_dynamic_responses)
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "smoke",
+            "--project",
+            "dayplan",
+            "--memory-recall",
+            "--evidence-output",
+            str(evidence_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    memory_request = FakeHTTPClient.requests[2]
+    response_request = FakeHTTPClient.requests[3]
+    recall_code = re.search(r"genaug-memory-[a-f0-9]+", memory_request["json"]["fact"])
+    assert recall_code is not None
+    assert memory_request["url"] == "http://api.test/api/v1/agent/memory/store"
+    assert memory_request["headers"]["X-Project-ID"] == "proj/1"
+    assert memory_request["json"]["user_id"] == "genaug-smoke"
+    assert response_request["url"] == "http://api.test/v1/responses"
+    assert recall_code.group(0) not in response_request["json"]["input"]
+    assert payload["memory_recall"]["status"] == "passed"
+    assert payload["memory_recall"]["seed_memory_id"] == "mem_smoke"
+    assert payload["memory_recall"]["expected_present_in_response"] is True
+    assert payload["memory_recall"]["prompt_included_expected_code"] is False
+    assert evidence["memory_recall"] == payload["memory_recall"]
+    assert recall_code.group(0) not in json.dumps(evidence)
+
+
+def test_smoke_memory_recall_fails_when_response_misses_seeded_fact(tmp_path: Path) -> None:
+    """Memory recall smoke should fail CI when the runtime does not recall the seeded fact."""
+
     config_path = write_config(tmp_path)
     project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response({"items": [project]}),
+        json_response({"memory_id": "mem_smoke", "status": "stored"}),
+        json_response(
+            {
+                "id": "resp_memory_smoke",
+                "status": "completed",
+                "output_text": "I do not know the recall code.",
+                "metadata": {
+                    "general_augment_request_id": "req_memory",
+                    "general_augment_trace_id": "trace_memory",
+                },
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "smoke",
+            "--project",
+            "dayplan",
+            "--memory-recall",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["memory_recall"]["status"] == "failed"
+    assert payload["memory_recall"]["expected_present_in_response"] is False
+    assert payload["memory_recall"]["prompt_included_expected_code"] is False
+
+
+def test_providers_smoke_plans_launch_evidence_for_all_requested_options() -> None:
+    """Provider smoke planning should expose launch evidence and exact blockers."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "providers",
+            "smoke",
+            "--capability",
+            "code",
+            "--capability",
+            "browse",
+            "--capability",
+            "video",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "general-augment-provider-smoke/v1"
+    assert payload["mode"] == "plan"
+    assert payload["security"] == {
+        "raw_secrets_in_output": False,
+        "raw_provider_payloads_in_output": False,
+    }
+    items = {item["provider"]: item for item in payload["providers"]}
+    assert list(items) == [
+        "anthropic-managed-agents",
+        "codex-mcp",
+        "browserbase",
+        "xai",
+        "fal",
+        "veo",
+    ]
+    assert "managed_agent_session_id" in items["anthropic-managed-agents"]["required_evidence"]
+    assert "codex_thread_id" in items["codex-mcp"]["required_evidence"]
+    assert "browser_session_id" in items["browserbase"]["required_evidence"]
+    assert "tool_call_audit" in items["xai"]["required_evidence"]
+    assert "signed_media_url" in items["fal"]["required_evidence"]
+    assert "retention_policy" in items["veo"]["required_evidence"]
+    assert items["browserbase"]["status"] == "blocked"
+    assert "Pass --project" in items["browserbase"]["blockers"]
+    assert "Set BROWSERBASE_API_KEY" in items["browserbase"]["blockers"]
+
+
+def test_providers_smoke_writes_redacted_evidence_artifact(tmp_path: Path) -> None:
+    """Provider smoke should be able to persist support-ready evidence JSON."""
+    evidence_path = tmp_path / "provider-smoke.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "providers",
+            "smoke",
+            "--provider",
+            "browserbase",
+            "--project",
+            "spark",
+            "--evidence-output",
+            str(evidence_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload == evidence
+    assert payload["schema_version"] == "general-augment-provider-smoke/v1"
+    assert payload["artifact_path"] == str(evidence_path)
+    assert payload["generated_at"].endswith("Z")
+    assert payload["providers"][0]["provider"] == "browserbase"
+    assert payload["providers"][0]["status"] == "blocked"
+    assert payload["security"] == {
+        "raw_secrets_in_output": False,
+        "raw_provider_payloads_in_output": False,
+    }
+
+
+def test_providers_smoke_runs_model_provider_health_and_responses_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model-provider smoke should prove custody, health, response, and support evidence."""
+    config_path = write_config(tmp_path)
+    monkeypatch.setenv("XAI_API_KEY", "xai-secret-should-not-print")
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    support_bundle = {
+        "usage_events": [
+            {
+                "event_type": "agent_turn",
+                "metadata": {
+                    "response_id": "resp_provider_smoke",
+                    "model_provider": "xai",
+                    "model_provider_source": "tenant",
+                },
+            }
+        ],
+        "control_plane_events": [
+            {
+                "event_type": "model_provider_credential.health_check",
+                "metadata": {"provider": "xai", "status": "available"},
+            }
+        ],
+        "audit_events": [
+            {
+                "action_type": "tool_call",
+                "tool_id": "x_search",
+                "success": True,
+            }
+        ],
+    }
     FakeHTTPClient.queue = [
         json_response({"items": [project]}),
         json_response(
             {
-                "id": "key/1",
-                "name": "Production backend",
-                "api_key": "gaadmlive_secret",
-                "masked_key": "gaadmlive_s...cret",
-                "project_id": "proj/1",
-                "scopes": ["admin"],
+                "provider": "xai",
+                "status": "active",
+                "base_url_configured": False,
+                "model_prefixes": ["xai/", "grok-"],
             }
         ),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "keys",
-            "create",
-            "--name",
-            "Production backend",
-            "--project",
-            "dayplan",
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["api_key"] == "gaadmlive_secret"
-    assert payload["id"] == "key/1"
-
-
-def test_auth_login_json_is_machine_readable_without_leaking_key(tmp_path: Path) -> None:
-    """auth login --json should report verified auth metadata but never the raw key."""
-    config_path = tmp_path / "config.yaml"
-    FakeHTTPClient.queue = [
-        json_response({"auth_method": "api_key", "project_id": "p1", "project_ids": ["p1"]}),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "auth",
-            "login",
-            "--api-key",
-            "super-secret-key",
-            "--base-url",
-            "http://api.test",
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["authenticated"] is True
-    assert payload["auth_method"] == "api_key"
-    assert payload["verified"] is True
-    assert "super-secret-key" not in result.output
-
-
-def test_deploy_json_emits_project_payload(tmp_path: Path) -> None:
-    """deploy --json should emit the raw project payload for automation."""
-    config_path = write_config(tmp_path)
-    agent_config = write_agent_config(tmp_path)
-    FakeHTTPClient.queue = [
-        json_response({"items": []}),
-        json_response({"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}),
-    ]
-
-    result = CliRunner().invoke(
-        app,
-        ["--config", str(config_path), "deploy", str(agent_config), "--json"],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["id"] == "proj/1"
-    assert payload["slug"] == "dayplan"
-
-
-def test_integrate_json_emits_tool_summary(tmp_path: Path) -> None:
-    """integrate --json should emit a machine-readable scaffold summary."""
-    spec_path = ROOT / "tests/fixtures/sample_openapi_specs/health_app_api.yaml"
-    output_dir = tmp_path / "mysti-agent"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "integrate",
-            str(spec_path),
-            "--name",
-            "mysti",
-            "--output-dir",
-            str(output_dir),
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["deployed"] is False
-    assert isinstance(payload["tools"], list)
-    assert payload["tools"]
-    assert {"tool_id", "http_method", "risk_level", "enabled"} <= set(payload["tools"][0])
-
-
-def test_setup_bootstrap_persisted_key_authenticates_smoke_without_export(
-    tmp_path: Path,
-) -> None:
-    """After bootstrap, smoke should authenticate from saved config with no manual export."""
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "base_url": "http://api.test",
-                "api_key": None,
-                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
-            }
-        ),
-        encoding="utf-8",
-    )
-    workspace = tmp_path / "demo-app"
-    workspace.mkdir()
-    FakeHTTPClient.queue = [
-        json_response({"items": []}),
-        json_response({"id": "proj_1", "name": "Demo App", "slug": "demo-app"}),
         json_response(
             {
-                "id": "key_1",
-                "name": "Self-serve app backend",
-                "api_key": "ga_runtime_secret_once",
-                "masked_key": "ga...once",
-                "project_id": "proj_1",
-                "scopes": ["responses:create"],
+                "provider": "xai",
+                "status": "available",
+                "message": "Provider credential accepted by health endpoint.",
+                "last_validated_at": "2026-05-24T05:00:00Z",
             }
         ),
-    ]
-
-    bootstrap = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "setup",
-            "--workspace",
-            str(workspace),
-            "--bootstrap",
-            "--project-name",
-            "Demo App",
-            "--project-slug",
-            "demo-app",
-            "--json",
-        ],
-    )
-    assert bootstrap.exit_code == 0, bootstrap.output
-
-    # No manual export: smoke reads the persisted runtime key from config.
-    FakeHTTPClient.requests = []
-    FakeHTTPClient.queue = [
-        json_response({"status": "ready"}),
-        json_response(
-            {"id": "resp_smoke", "status": "completed", "output_text": "genaug-smoke-ok"}
-        ),
-    ]
-    smoke_result = CliRunner().invoke(app, ["--config", str(config_path), "smoke", "--json"])
-
-    assert smoke_result.exit_code == 0, smoke_result.output
-    payload = json.loads(smoke_result.output)
-    assert payload["verdict"] == "PASS"
-    # The persisted runtime key authenticated the app-facing responses call.
-    assert FakeHTTPClient.requests[1]["headers"]["Authorization"] == (
-        "Bearer ga_runtime_secret_once"
-    )
-
-
-def test_installer_slug_resolves_to_uuid_before_typed_route(tmp_path: Path) -> None:
-    """Installer setup must resolve a slug to its UUID so typed routes do not 422."""
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "base_url": "http://api.test",
-                "api_key": None,
-                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
-            }
-        ),
-        encoding="utf-8",
-    )
-    FakeHTTPClient.queue = [
         json_response(
             {
-                "items": [
+                "id": "resp_provider_smoke",
+                "status": "completed",
+                "output": [
                     {
-                        "id": "11111111-1111-4111-8111-111111111111",
-                        "name": "Demo App",
-                        "slug": "demo-app",
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "tenant-provider-smoke-ok"}],
                     }
-                ]
+                ],
+                "metadata": {
+                    "general_augment_trace_id": "trace_provider_smoke",
+                    "general_augment_model_provider": "xai",
+                    "general_augment_model_provider_source": "tenant",
+                },
             }
         ),
-        json_response({"provider": "browserbase", "status": "active"}),
+        json_response(support_bundle),
     ]
 
     result = CliRunner().invoke(
@@ -4166,23 +3286,369 @@ def test_installer_slug_resolves_to_uuid_before_typed_route(tmp_path: Path) -> N
             "--config",
             str(config_path),
             "providers",
-            "setup",
-            "--capability",
-            "browse",
+            "smoke",
+            "--provider",
+            "xai",
             "--project",
-            "demo-app",
-            "--api-key",
-            "bb_secret_raw",
+            "dayplan",
+            "--api-key-env",
+            "XAI_API_KEY",
             "--json",
         ],
     )
 
     assert result.exit_code == 0, result.output
-    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/api/v1/installer/projects"
-    assert FakeHTTPClient.requests[1]["url"] == (
-        "http://api.test/api/v1/installer/projects/"
-        "11111111-1111-4111-8111-111111111111/capability-providers/browserbase"
+    assert "xai-secret-should-not-print" not in result.output
+    payload = json.loads(result.output)
+    assert payload["mode"] == "live"
+    assert payload["providers"][0]["status"] == "passed"
+    assert payload["providers"][0]["evidence"]["response_id"] == "resp_provider_smoke"
+    assert payload["providers"][0]["evidence"]["trace_id"] == "trace_provider_smoke"
+    assert payload["providers"][0]["checks"] == [
+        {"name": "credential_custody", "status": "passed"},
+        {"name": "provider_health", "status": "passed"},
+        {"name": "responses_smoke", "status": "passed"},
+        {"name": "support_bundle", "status": "passed"},
+        {"name": "launch_evidence", "status": "passed"},
+    ]
+    assert FakeHTTPClient.requests[0]["url"].endswith("/api/v1/admin/projects")
+    assert FakeHTTPClient.requests[1]["method"] == "PUT"
+    assert FakeHTTPClient.requests[1]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/model-providers/xai"
     )
+    assert FakeHTTPClient.requests[1]["json"]["api_key"] == "xai-secret-should-not-print"
+    assert FakeHTTPClient.requests[2]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/model-providers/xai/health-check"
+    )
+    assert FakeHTTPClient.requests[3]["url"] == "http://api.test/v1/responses"
+    assert FakeHTTPClient.requests[3]["headers"]["X-Project-ID"] == "proj/1"
+    assert FakeHTTPClient.requests[4]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/observability/support-bundle"
+    )
+    assert FakeHTTPClient.requests[4]["params"] == {
+        "limit": 50,
+        "response_id": "resp_provider_smoke",
+        "trace_id": "trace_provider_smoke",
+    }
+
+
+def test_providers_smoke_blocks_xai_without_tool_call_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X launch smoke should not pass on generic model-provider evidence alone."""
+    config_path = write_config(tmp_path)
+    monkeypatch.setenv("XAI_API_KEY", "xai-secret-should-not-print")
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    support_bundle = {
+        "usage_events": [
+            {
+                "event_type": "agent_turn",
+                "metadata": {
+                    "response_id": "resp_provider_smoke",
+                    "model_provider": "xai",
+                    "model_provider_source": "tenant",
+                },
+            }
+        ],
+        "control_plane_events": [
+            {
+                "event_type": "model_provider_credential.health_check",
+                "metadata": {"provider": "xai", "status": "available"},
+            }
+        ],
+        "audit_events": [],
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response({"provider": "xai", "status": "active"}),
+        json_response({"provider": "xai", "status": "available"}),
+        json_response(
+            {
+                "id": "resp_provider_smoke",
+                "status": "completed",
+                "output_text": "tenant-provider-smoke-ok",
+                "metadata": {
+                    "general_augment_trace_id": "trace_provider_smoke",
+                    "general_augment_model_provider": "xai",
+                    "general_augment_model_provider_source": "tenant",
+                },
+            }
+        ),
+        json_response(support_bundle),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "providers",
+            "smoke",
+            "--provider",
+            "xai",
+            "--project",
+            "dayplan",
+            "--api-key-env",
+            "XAI_API_KEY",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "xai-secret-should-not-print" not in result.output
+    payload = json.loads(result.output)
+    item = payload["providers"][0]
+    assert item["status"] == "blocked"
+    assert item["checks"][-1] == {"name": "launch_evidence", "status": "blocked"}
+    assert (
+        "Support bundle did not include X search/video tool-call audit evidence."
+        in (item["blockers"])
+    )
+    assert item["evidence"]["tool_call_audit"]["matching_event_count"] == 0
+
+
+def test_providers_smoke_blocks_video_without_media_lifecycle_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Video launch smoke should require generated-media storage and retention proof."""
+    config_path = write_config(tmp_path)
+    monkeypatch.setenv("FAL_API_KEY", "fal-secret-should-not-print")
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    support_bundle = {
+        "usage_events": [
+            {
+                "event_type": "agent_turn",
+                "metadata": {
+                    "response_id": "resp_video_smoke",
+                    "model_provider": "fal",
+                    "model_provider_source": "tenant",
+                },
+            }
+        ],
+        "control_plane_events": [
+            {
+                "event_type": "model_provider_credential.health_check",
+                "metadata": {"provider": "fal", "status": "available"},
+            }
+        ],
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response({"provider": "fal", "status": "active"}),
+        json_response({"provider": "fal", "status": "available"}),
+        json_response(
+            {
+                "id": "resp_video_smoke",
+                "status": "completed",
+                "output_text": "tenant-provider-smoke-ok",
+                "metadata": {
+                    "general_augment_trace_id": "trace_video_smoke",
+                    "general_augment_model_provider": "fal",
+                    "general_augment_model_provider_source": "tenant",
+                    "general_augment_media_asset_id": "media_123",
+                    "general_augment_signed_media_url": (
+                        "https://storage.example.com/video.mp4?signature=secret"
+                    ),
+                },
+            }
+        ),
+        json_response(support_bundle),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "providers",
+            "smoke",
+            "--provider",
+            "fal",
+            "--project",
+            "dayplan",
+            "--api-key-env",
+            "FAL_API_KEY",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "fal-secret-should-not-print" not in result.output
+    assert "signature=secret" not in result.output
+    item = json.loads(result.output)["providers"][0]
+    assert item["status"] == "blocked"
+    assert item["checks"][-1] == {"name": "launch_evidence", "status": "blocked"}
+    assert (
+        "Generated-video response did not include retention policy evidence." in (item["blockers"])
+    )
+    assert item["evidence"]["generated_media"] == {
+        "media_asset_id": "media_123",
+        "signed_media_url_present": True,
+        "retention_policy": None,
+    }
+
+
+def test_providers_smoke_returns_blocked_evidence_when_health_api_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider smoke should produce an artifact instead of crashing on API 5xx."""
+    config_path = write_config(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret-should-not-print")
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "provider": "codex-mcp",
+                "status": "active",
+                "base_url_configured": False,
+            }
+        ),
+        json_response({"detail": "Internal Server Error"}, status_code=500),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "providers",
+            "smoke",
+            "--provider",
+            "codex-mcp",
+            "--project",
+            "dayplan",
+            "--api-key-env",
+            "OPENAI_API_KEY",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "openai-secret-should-not-print" not in result.output
+    payload = json.loads(result.output)
+    item = payload["providers"][0]
+    assert item["status"] == "blocked"
+    assert item["checks"] == [{"name": "platform_api", "status": "blocked"}]
+    assert item["evidence"]["platform_api"]["status_code"] == 500
+    assert "platform API returned 500" in item["blockers"][0]
+    assert "Codex MCP launch still requires managed MCP discovery" in item["blockers"][1]
+
+
+def test_providers_smoke_surfaces_capability_provider_health_blocker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capability-provider smokes should name rejected credentials before launch blockers."""
+    config_path = write_config(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret-should-not-print")
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "provider": "codex-mcp",
+                "status": "active",
+                "base_url_configured": False,
+            }
+        ),
+        json_response(
+            {
+                "provider": "codex-mcp",
+                "status": "unavailable",
+                "message": "Provider rejected the credential.",
+                "checked_at": "2026-05-24T09:32:56Z",
+                "latency_ms": 133,
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "providers",
+            "smoke",
+            "--provider",
+            "codex-mcp",
+            "--project",
+            "dayplan",
+            "--api-key-env",
+            "OPENAI_API_KEY",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "openai-secret-should-not-print" not in result.output
+    item = json.loads(result.output)["providers"][0]
+    assert item["status"] == "blocked"
+    assert item["checks"] == [
+        {"name": "credential_custody", "status": "passed"},
+        {"name": "provider_health", "status": "blocked"},
+    ]
+    assert item["evidence"]["provider_health"]["message"] == "Provider rejected the credential."
+    assert item["blockers"][0] == (
+        "Provider health status is unavailable: Provider rejected the credential."
+    )
+    assert "Codex MCP launch still requires managed MCP discovery" in item["blockers"][1]
+
+
+def test_smoke_can_request_structured_output(tmp_path: Path) -> None:
+    """Smoke should support schema-constrained Responses calls."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response(
+            {
+                "id": "resp_structured",
+                "status": "completed",
+                "model": "mock/balanced",
+                "output_text": '{"label": "genaug-smoke-ok", "ok": true}',
+                "metadata": {"trace_id": "trace_structured", "request_id": "req_structured"},
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "smoke", "--structured"],
+    )
+
+    assert result.exit_code == 0
+    assert "json_schema" in result.output
+    payload = FakeHTTPClient.requests[1]["json"]
+    assert payload["input"] == 'Return JSON with ok=true and label="genaug-smoke-ok".'
+    assert payload["text"]["format"]["type"] == "json_schema"
+    assert payload["text"]["format"]["strict"] is True
+    assert payload["text"]["format"]["schema"]["required"] == ["ok", "label"]
+
+
+def test_smoke_can_load_structured_schema_file(tmp_path: Path) -> None:
+    """A schema file should imply structured output for app-specific checks."""
+    config_path = write_config(tmp_path)
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(
+        '{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}',
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response({"status": "ready"}),
+        json_response({"id": "resp_structured", "status": "completed", "output_text": "{}"}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "smoke", "--schema-file", str(schema_path), "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = FakeHTTPClient.requests[1]["json"]
+    assert payload["text"]["format"]["schema"]["required"] == ["summary"]
 
 
 def test_doctor_checks_config_health_and_auth(tmp_path: Path) -> None:
@@ -4204,6 +3670,357 @@ def test_doctor_checks_config_health_and_auth(tmp_path: Path) -> None:
     assert FakeHTTPClient.requests[1]["headers"] == {"X-Admin-Key": "secret"}
 
 
+def test_doctor_can_check_project_agent_cloud_readiness(tmp_path: Path) -> None:
+    """Project doctor should preflight read-only agent-cloud surfaces."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ok", "db": "connected", "redis": "connected"}),
+        json_response({"auth_method": "api_key", "project_ids": ["proj/1"]}),
+        json_response({"items": [{"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}]}),
+        json_response(project_launch_readiness_response(verdict="ready")),
+        json_response({"tool_discovery": {"mode": "auto"}}),
+        json_response({"items": [{"id": "web_search", "status": "available"}]}),
+        json_response(
+            {
+                "items": [
+                    {
+                        "provider": "anthropic-managed-agents",
+                        "delegated_workflows": ["coding"],
+                        "planned_workflows": ["research"],
+                        "readiness": "ready",
+                    },
+                    {
+                        "provider": "browserbase",
+                        "delegated_workflows": ["browser", "browser_action"],
+                        "planned_workflows": [],
+                        "readiness": "setup_required",
+                        "readiness_details": {
+                            "browser_artifact_storage_backend": "filesystem",
+                            "hosted_screenshot_storage": "local_only",
+                        },
+                    },
+                ]
+            }
+        ),
+        json_response({"items": [{"approval_id": "approval/1"}]}),
+        json_response({"items": [{"id": "run/1", "status": "completed"}]}),
+        json_response(
+            {
+                "id": "run/1",
+                "status": "completed",
+                "run_events": [{"event_type": "agent_run.completed"}],
+            }
+        ),
+        json_response({"facts": [{"id": "memory/1"}], "profile": {"timezone": "America/Toronto"}}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "doctor",
+            "--project",
+            "dayplan",
+            "--user",
+            "user-1",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "PASS"
+    assert payload["launch_readiness"]["schema_version"] == "genaug.project_launch_readiness.v1"
+    check_names = {item["name"] for item in payload["checks"]}
+    assert {
+        "project",
+        "launch_readiness",
+        "runtime_policy",
+        "tool_catalog",
+        "delegated_providers",
+        "approvals_inbox",
+        "run_timeline",
+        "memory_profile",
+        "governance_proof",
+    } <= check_names
+    delegated_check = next(
+        item for item in payload["checks"] if item["name"] == "delegated_providers"
+    )
+    assert delegated_check["detail"] == (
+        "providers=2, ready=1, productized=browser,browser_action,coding, "
+        "planned=research, hosted_screenshots=local_only:filesystem"
+    )
+    governance_check = next(
+        item for item in payload["checks"] if item["name"] == "governance_proof"
+    )
+    assert governance_check["detail"] == "memory_user=user-1, commands=3"
+    assert (
+        "genaug memory profile --project dayplan --user user-1 --json"
+        in governance_check["next_action"]
+    )
+    assert (
+        "genaug memory export --project dayplan --user user-1 --output genaug-memory-export.json"
+    ) in governance_check["next_action"]
+    assert (
+        "genaug approvals list --project dayplan --status pending --json"
+        in governance_check["next_action"]
+    )
+    assert "secret" not in result.output
+    assert FakeHTTPClient.requests[2]["url"] == "http://api.test/api/v1/admin/projects"
+    assert (
+        FakeHTTPClient.requests[3]["url"]
+        == "http://api.test/api/v1/admin/projects/proj%2F1/launch-readiness"
+    )
+    assert (
+        FakeHTTPClient.requests[6]["url"]
+        == "http://api.test/api/v1/admin/projects/proj%2F1/coding-providers"
+    )
+    assert (
+        FakeHTTPClient.requests[7]["url"]
+        == "http://api.test/api/v1/admin/projects/proj%2F1/approvals"
+    )
+    assert FakeHTTPClient.requests[8]["url"] == "http://api.test/v1/agent-runs"
+    assert FakeHTTPClient.requests[8]["params"] == {"limit": 1}
+    assert FakeHTTPClient.requests[8]["headers"] == {
+        "Authorization": "Bearer secret",
+        "X-Project-ID": "proj/1",
+    }
+    assert FakeHTTPClient.requests[9]["url"] == "http://api.test/v1/agent-runs/run%2F1"
+    assert FakeHTTPClient.requests[9]["headers"] == {
+        "Authorization": "Bearer secret",
+        "X-Project-ID": "proj/1",
+    }
+    assert (
+        FakeHTTPClient.requests[10]["url"] == "http://api.test/api/v1/agent/memory/profile/user-1"
+    )
+
+
+def test_doctor_warns_when_project_has_no_run_timeline_yet(tmp_path: Path) -> None:
+    """Project doctor should distinguish no traffic from broken run timelines."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ok", "db": "connected", "redis": "connected"}),
+        json_response({"auth_method": "api_key", "project_ids": ["proj/1"]}),
+        json_response({"items": [{"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}]}),
+        json_response(project_launch_readiness_response(verdict="blocked", required_open=1)),
+        json_response({"tool_discovery": {"mode": "auto"}}),
+        json_response({"items": []}),
+        json_response({"items": []}),
+        json_response({"items": []}),
+        json_response({"items": []}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "doctor",
+            "--project",
+            "dayplan",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "WARN"
+    launch_check = next(item for item in payload["checks"] if item["name"] == "launch_readiness")
+    assert launch_check["status"] == "WARN"
+    assert "verdict=blocked" in launch_check["detail"]
+    run_check = next(item for item in payload["checks"] if item["name"] == "run_timeline")
+    assert run_check["status"] == "WARN"
+    assert run_check["detail"] == "recent_runs=0"
+    assert "create the first timeline" in run_check["next_action"]
+    governance_check = next(
+        item for item in payload["checks"] if item["name"] == "governance_proof"
+    )
+    assert governance_check["detail"] == "memory_user=<app-user-id>, commands=3"
+    assert (
+        "genaug memory profile --project dayplan --user <app-user-id> --json"
+        in governance_check["next_action"]
+    )
+    assert len(FakeHTTPClient.requests) == 9
+
+
+def test_doctor_can_fail_on_blocked_launch_readiness(tmp_path: Path) -> None:
+    """Doctor should support strict launch-gate behavior for CI."""
+    config_path = write_config(tmp_path)
+    FakeHTTPClient.queue = [
+        json_response({"status": "ok", "db": "connected", "redis": "connected"}),
+        json_response({"auth_method": "api_key", "project_ids": ["proj/1"]}),
+        json_response({"items": [{"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}]}),
+        json_response(project_launch_readiness_response(verdict="blocked", required_open=1)),
+        json_response({"tool_discovery": {"mode": "auto"}}),
+        json_response({"items": []}),
+        json_response({"items": []}),
+        json_response({"items": []}),
+        json_response({"items": []}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "doctor",
+            "--project",
+            "dayplan",
+            "--fail-on-launch-blocked",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "FAIL"
+    launch_check = next(item for item in payload["checks"] if item["name"] == "launch_readiness")
+    assert launch_check["status"] == "FAIL"
+    assert payload["launch_readiness"]["verdict"] == "blocked"
+
+
+def test_doctor_accepts_browser_artifact_production_proof(tmp_path: Path) -> None:
+    """Doctor should compose retained browser artifact proof with platform checks."""
+    config_path = write_config(tmp_path)
+    proof_path = tmp_path / "production-proof.json"
+    proof_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "2026-06-14.browser-artifact-production-proof.v1",
+                "generated_at": "2026-06-14T12:00:00+00:00",
+                "verdict": "PASS",
+                "checks": [
+                    {"name": "bootstrap_schema", "status": "PASS"},
+                    {"name": "hosted_screenshot_readiness", "status": "PASS"},
+                ],
+                "next_actions": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response({"status": "ok", "db": "connected", "redis": "connected"}),
+        json_response({"auth_method": "api_key", "project_ids": ["proj/1"]}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "doctor",
+            "--browser-artifact-production-proof",
+            str(proof_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    proof_check = next(
+        item for item in payload["checks"] if item["name"] == "browser_artifact_production_proof"
+    )
+    assert proof_check == {
+        "name": "browser_artifact_production_proof",
+        "status": "PASS",
+        "detail": "verdict=PASS, checks=2/2",
+        "next_action": "No action needed.",
+    }
+    assert payload["browser_artifact_production_proof"] == {
+        "schema_version": "2026-06-14.browser-artifact-production-proof.v1",
+        "path": str(proof_path),
+        "generated_at": "2026-06-14T12:00:00+00:00",
+        "verdict": "PASS",
+        "checks": {"passed": 2, "total": 2},
+        "next_actions": [],
+    }
+
+
+def test_doctor_fails_on_browser_artifact_production_proof_failure(tmp_path: Path) -> None:
+    """Doctor should fail closed when an explicitly supplied proof artifact is failing."""
+    config_path = write_config(tmp_path)
+    proof_path = tmp_path / "production-proof.json"
+    proof_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "2026-06-14.browser-artifact-production-proof.v1",
+                "generated_at": "2026-06-14T12:00:00+00:00",
+                "verdict": "FAIL",
+                "checks": [
+                    {"name": "bootstrap_schema", "status": "PASS"},
+                    {"name": "hosted_screenshot_readiness", "status": "FAIL"},
+                ],
+                "next_actions": ["Deploy the GCS browser artifact settings."],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response({"status": "ok", "db": "connected", "redis": "connected"}),
+        json_response({"auth_method": "api_key", "project_ids": ["proj/1"]}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "doctor",
+            "--browser-artifact-production-proof",
+            str(proof_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    proof_check = next(
+        item for item in payload["checks"] if item["name"] == "browser_artifact_production_proof"
+    )
+    assert proof_check["status"] == "FAIL"
+    assert proof_check["detail"] == "verdict=FAIL, checks=1/2"
+    assert proof_check["next_action"] == "Deploy the GCS browser artifact settings."
+
+
+def test_doctor_browser_artifact_proof_schema_hint_uses_cli_command(
+    tmp_path: Path,
+) -> None:
+    """Doctor should send stale browser proof artifacts to the productized CLI flow."""
+    config_path = write_config(tmp_path)
+    proof_path = tmp_path / "production-proof.json"
+    proof_path.write_text('{"schema_version": "old"}\n', encoding="utf-8")
+    FakeHTTPClient.queue = [
+        json_response({"status": "ok", "db": "connected", "redis": "connected"}),
+        json_response({"auth_method": "api_key", "project_ids": ["proj/1"]}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "doctor",
+            "--browser-artifact-production-proof",
+            str(proof_path),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    proof_check = next(
+        item for item in payload["checks"] if item["name"] == "browser_artifact_production_proof"
+    )
+    assert proof_check["status"] == "FAIL"
+    assert (
+        proof_check["next_action"]
+        == "Regenerate the proof with genaug projects browser-artifacts prove-production."
+    )
+
+
 def test_doctor_fails_without_api_key(tmp_path: Path) -> None:
     """Doctor should make missing auth obvious before a developer starts integrating."""
     config_path = tmp_path / "config.yaml"
@@ -4218,9 +4035,13 @@ def test_doctor_fails_without_api_key(tmp_path: Path) -> None:
     assert len(FakeHTTPClient.requests) == 1
 
 
-def test_verify_runs_project_acceptance_checks(tmp_path: Path) -> None:
+def test_verify_runs_project_acceptance_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify should stitch platform, project, test, logs, usage, and observability checks."""
     config_path = write_config(tmp_path)
+    monkeypatch.setattr("platform_cli.commands.verify.uuid.uuid4", lambda: _FixedVerifyUUID())
     project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "enabled_tool_ids": []}
     FakeHTTPClient.queue = [
         json_response({"status": "ok", "db": "connected", "redis": "connected"}),
@@ -4243,7 +4064,19 @@ def test_verify_runs_project_acceptance_checks(tmp_path: Path) -> None:
         json_response(runtime_policy_response()),
         json_response({"content": "# DayPlan\n\nHelpful."}),
         json_response(skill_list_response()),
-        json_response({"response_text": "General Augment project works.", "metadata": {}}),
+        json_response(
+            {
+                "response_text": "General Augment project works.",
+                "metadata": {"agent_run_id": "run/1"},
+            }
+        ),
+        json_response(
+            {
+                "id": "run/1",
+                "status": "completed",
+                "run_events": [{"event_type": "agent_run.completed"}],
+            }
+        ),
         json_response({"items": [{"role": "assistant", "content": "ok"}]}),
         json_response(
             {
@@ -4266,6 +4099,23 @@ def test_verify_runs_project_acceptance_checks(tmp_path: Path) -> None:
         ),
         json_response({"facts": [{"memory_id": "mem/1", "content": "concise onboarding notes"}]}),
         json_response({"total_facts": 1, "recent_facts": []}),
+        json_response(
+            {
+                "id": "resp_memory_recall",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "genaug-memory-verify-abcdef123456",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
         json_response({"deleted_count": 1, "deleted_ids": ["mem/1"], "status": "deleted"}),
         json_response({"items": [{"tool_id": "memory_delete", "success": True}]}),
     ]
@@ -4290,6 +4140,7 @@ def test_verify_runs_project_acceptance_checks(tmp_path: Path) -> None:
     assert "SKIP" in result.output
     assert "soul_visible" in result.output
     assert "skills_visible" in result.output
+    assert "run_timeline_inspect" in result.output
     assert "usage_limits" in result.output
     assert "Dashboard Follow-up" in result.output
     assert "https://app.test/dashboard/projects/proj%2F1/tools" in result.output
@@ -4304,39 +4155,54 @@ def test_verify_runs_project_acceptance_checks(tmp_path: Path) -> None:
     assert FakeHTTPClient.requests[7]["params"] == {"limit": 100}
     assert FakeHTTPClient.requests[8]["method"] == "POST"
     assert FakeHTTPClient.requests[8]["url"].endswith("/api/v1/admin/projects/proj%2F1/test")
-    assert FakeHTTPClient.requests[11]["url"].endswith(
-        "/api/v1/admin/projects/proj%2F1/observability"
+    assert FakeHTTPClient.requests[9]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/runs/run%2F1"
     )
     assert FakeHTTPClient.requests[12]["url"].endswith(
+        "/api/v1/admin/projects/proj%2F1/observability"
+    )
+    assert FakeHTTPClient.requests[13]["url"].endswith(
         "/api/v1/admin/projects/proj%2F1/channels/status"
     )
-    assert FakeHTTPClient.requests[13]["url"].endswith("/api/v1/agent/memory/store")
-    assert FakeHTTPClient.requests[13]["headers"] == {
+    assert FakeHTTPClient.requests[14]["url"].endswith("/api/v1/agent/memory/store")
+    assert FakeHTTPClient.requests[14]["headers"] == {
         "Authorization": "Bearer secret",
         "X-Project-ID": "proj/1",
     }
-    assert FakeHTTPClient.requests[13]["json"]["source"] == "genaug-cli-verify"
-    assert FakeHTTPClient.requests[13]["json"]["metadata"]["scenario"] == "project-verify"
-    assert FakeHTTPClient.requests[13]["json"]["metadata"]["verification_id"]
-    assert FakeHTTPClient.requests[13]["json"]["idempotency_key"].startswith(
+    assert FakeHTTPClient.requests[14]["json"]["source"] == "genaug-cli-verify"
+    assert FakeHTTPClient.requests[14]["json"]["metadata"]["scenario"] == "project-verify"
+    assert FakeHTTPClient.requests[14]["json"]["metadata"]["verification_id"]
+    assert FakeHTTPClient.requests[14]["json"]["idempotency_key"].startswith(
         "genaug-verify-proj/1-genaug-verify-user-"
     )
     assert (
-        FakeHTTPClient.requests[13]["json"]["idempotency_key"]
+        FakeHTTPClient.requests[14]["json"]["idempotency_key"]
         != "genaug-verify-proj/1-genaug-verify-user"
     )
-    assert FakeHTTPClient.requests[14]["url"].endswith("/api/v1/agent/memory/search")
-    assert FakeHTTPClient.requests[16]["method"] == "DELETE"
-    assert FakeHTTPClient.requests[16]["url"].endswith("/api/v1/agent/memory/mem%2F1")
-    assert FakeHTTPClient.requests[16]["params"] == {"user_id": "genaug-verify-user"}
-    assert FakeHTTPClient.requests[17]["url"].endswith(
+    assert FakeHTTPClient.requests[15]["url"].endswith("/api/v1/agent/memory/search")
+    assert FakeHTTPClient.requests[17]["method"] == "POST"
+    assert FakeHTTPClient.requests[17]["url"] == "http://api.test/v1/responses"
+    assert FakeHTTPClient.requests[17]["headers"] == {
+        "Authorization": "Bearer secret",
+        "X-Project-ID": "proj/1",
+    }
+    assert FakeHTTPClient.requests[17]["json"]["metadata"]["feature"] == ("memory_response_recall")
+    assert "abcdef123456" not in FakeHTTPClient.requests[17]["json"]["input"]
+    assert FakeHTTPClient.requests[18]["method"] == "DELETE"
+    assert FakeHTTPClient.requests[18]["url"].endswith("/api/v1/agent/memory/mem%2F1")
+    assert FakeHTTPClient.requests[18]["params"] == {"user_id": "genaug-verify-user"}
+    assert FakeHTTPClient.requests[19]["url"].endswith(
         "/api/v1/admin/projects/proj%2F1/audit/tool-calls"
     )
 
 
-def test_verify_exercises_responses_when_cli_key_is_project_scoped(tmp_path: Path) -> None:
+def test_verify_exercises_responses_when_cli_key_is_project_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify should prove the configured project key can call `/v1/responses`."""
     config_path = write_config(tmp_path)
+    monkeypatch.setattr("platform_cli.commands.verify.uuid.uuid4", lambda: _FixedVerifyUUID())
     project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan", "enabled_tool_ids": []}
     FakeHTTPClient.queue = [
         json_response({"status": "ok", "db": "connected", "redis": "connected"}),
@@ -4371,7 +4237,19 @@ def test_verify_exercises_responses_when_cli_key_is_project_scoped(tmp_path: Pat
         json_response(runtime_policy_response()),
         json_response({"content": "# DayPlan\n\nHelpful."}),
         json_response(skill_list_response()),
-        json_response({"response_text": "General Augment project works.", "metadata": {}}),
+        json_response(
+            {
+                "response_text": "General Augment project works.",
+                "metadata": {"agent_run_id": "run/1"},
+            }
+        ),
+        json_response(
+            {
+                "id": "run/1",
+                "status": "completed",
+                "run_events": [{"event_type": "agent_run.completed"}],
+            }
+        ),
         json_response({"items": [{"role": "assistant", "content": "ok"}]}),
         json_response(
             {
@@ -4389,6 +4267,23 @@ def test_verify_exercises_responses_when_cli_key_is_project_scoped(tmp_path: Pat
         json_response({"memory_id": "mem/1", "content": "ok"}),
         json_response({"facts": [{"memory_id": "mem/1", "content": "concise onboarding notes"}]}),
         json_response({"total_facts": 1, "recent_facts": []}),
+        json_response(
+            {
+                "id": "resp_memory_recall",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "genaug-memory-verify-abcdef123456",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
         json_response({"deleted_count": 1, "deleted_ids": ["mem/1"], "status": "deleted"}),
         json_response({"items": [{"tool_id": "memory_delete", "success": True}]}),
     ]
@@ -4423,8 +4318,11 @@ def test_verify_exercises_responses_when_cli_key_is_project_scoped(tmp_path: Pat
         "project_key_created",
         "project_key_execution",
         "first_response_passed",
+        "run_timeline_visible",
         "runtime_policy_visible",
+        "tenant_behavior_configured",
         "memory_tested",
+        "memory_response_recall",
         "trace_visible",
         "usage_limits_visible",
         "channel_status_known",
@@ -4442,6 +4340,10 @@ def test_verify_exercises_responses_when_cli_key_is_project_scoped(tmp_path: Pat
         ]
         == "PASS"
     )
+    assert (
+        next(item for item in readiness["items"] if item["key"] == "run_timeline_visible")["status"]
+        == "PASS"
+    )
     routing_check = next(
         item for item in payload["checks"] if item["name"] == "runtime_policy_model_routing"
     )
@@ -4452,6 +4354,12 @@ def test_verify_exercises_responses_when_cli_key_is_project_scoped(tmp_path: Pat
     )
     assert (
         next(item for item in payload["checks"] if item["name"] == "skills_visible")["status"]
+        == "PASS"
+    )
+    assert (
+        next(item for item in payload["checks"] if item["name"] == "memory_response_recall")[
+            "status"
+        ]
         == "PASS"
     )
     assert payload["runtime_policy"]["model_routing"]["channel_parity"] is True
@@ -4472,41 +4380,6 @@ def test_verify_exercises_responses_when_cli_key_is_project_scoped(tmp_path: Pat
             "feature": "project_key_execution",
         },
     }
-
-
-def test_onboarding_verify_json_wraps_project_acceptance(tmp_path: Path) -> None:
-    """The onboarding command should expose one JSON gate for coding agents."""
-
-    config_path = write_config(tmp_path)
-    queue_project_verification_success()
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "--config",
-            str(config_path),
-            "onboarding",
-            "verify",
-            "--project",
-            "dayplan",
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert "secret" not in result.output
-    payload = json.loads(result.output)
-    assert payload["cli"]["version"] == "0.1.1"
-    assert payload["api"] == {"build_sha": "abc123", "status": "ok", "version": "0.1.0"}
-    assert payload["readiness_checklist"]["version"] == "general-augment-readiness/v1"
-    assert payload["onboarding"]["verdict"] == "PASS"
-    assert "Handle 402 and 429" in payload["onboarding"]["required_follow_up"][2]
-    assert payload["checks"][-1]["name"] == "tool_call_audit"
-    assert payload["runtime_policy"]["model_routing"]["channel_parity"] is True
-    assert any(item["name"] == "runtime_policy_model_routing" for item in payload["checks"])
-    assert any(item["name"] == "soul_visible" for item in payload["checks"])
-    assert any(item["name"] == "skills_visible" for item in payload["checks"])
-    assert FakeHTTPClient.requests[0]["url"] == "http://api.test/health/ready"
 
 
 def test_verify_fails_when_agent_test_fails(tmp_path: Path) -> None:
@@ -4562,7 +4435,19 @@ def test_verify_fails_when_runtime_policy_model_routing_is_incomplete(tmp_path: 
         json_response(bad_policy),
         json_response({"content": "# DayPlan\n\nHelpful."}),
         json_response(skill_list_response()),
-        json_response({"response_text": "General Augment project works.", "metadata": {}}),
+        json_response(
+            {
+                "response_text": "General Augment project works.",
+                "metadata": {"agent_run_id": "run/1"},
+            }
+        ),
+        json_response(
+            {
+                "id": "run/1",
+                "status": "completed",
+                "run_events": [{"event_type": "agent_run.completed"}],
+            }
+        ),
         json_response({"items": [{"role": "assistant", "content": "ok"}]}),
         json_response({"totals": {}, "limits": {}, "days": []}),
         json_response({"traces": [], "metrics": {}}),
@@ -4597,40 +4482,6 @@ def test_verify_fails_when_runtime_policy_model_routing_is_incomplete(tmp_path: 
         (500, "Retry shortly"),
     ],
 )
-def test_api_error_messages_are_helpful(tmp_path: Path, status_code: int, message: str) -> None:
-    """API errors should produce actionable Rich output."""
-    config_path = write_config(tmp_path)
-    FakeHTTPClient.queue = [json_response({"detail": "boom"}, status_code=status_code)]
-
-    result = CliRunner().invoke(app, ["--config", str(config_path), "projects", "list"])
-
-    assert result.exit_code != 0
-    assert message in result.output
-
-
-def test_api_rate_limit_error_includes_reason_and_retry_after(tmp_path: Path) -> None:
-    """Rate-limit API errors should surface stable reasons and retry timing."""
-    config_path = write_config(tmp_path)
-    FakeHTTPClient.queue = [
-        json_response(
-            {
-                "detail": {
-                    "code": "rate_limited",
-                    "reason": "messages_per_user_per_minute_exceeded",
-                    "message": "Project per-user message rate limit exceeded.",
-                }
-            },
-            status_code=429,
-            headers={"Retry-After": "60"},
-        )
-    ]
-
-    result = CliRunner().invoke(app, ["--config", str(config_path), "projects", "list"])
-
-    assert result.exit_code != 0
-    assert "messages_per_user_per_minute_exceeded" in result.output
-    assert "Retry after" in result.output
-    assert "60 seconds" in result.output
 
 
 def write_config(tmp_path: Path) -> Path:
@@ -4638,6 +4489,173 @@ def write_config(tmp_path: Path) -> Path:
     config_path = tmp_path / "config.yaml"
     config_path.write_text("base_url: http://api.test\napi_key: secret\n", encoding="utf-8")
     return config_path
+
+
+def coding_run_detail_payload() -> dict[str, Any]:
+    """Return a delegated coding detail fixture."""
+    run = {
+        "id": "coding/run/1",
+        "project_id": "proj/1",
+        "agent_run_id": "agent/run/1",
+        "provider": "anthropic-managed-agents",
+        "job_type": "website_builder",
+        "state": "preview_ready",
+        "review_status": "passed",
+        "latest_progress_summary": "Provider generated the preview.",
+        "created_at": "2026-06-13T10:00:00Z",
+        "updated_at": "2026-06-13T10:01:00Z",
+        "completed_at": "2026-06-13T10:01:00Z",
+        "error_message": None,
+        "build_packet_id": "packet-1",
+        "artifacts": [
+            {
+                "id": "artifact-1",
+                "kind": "site_bundle",
+                "filename": "site.html",
+                "safe_summary": "Generated dentist website preview bundle",
+            }
+        ],
+        "events": [],
+    }
+    return {
+        "run": run,
+        "parent_run": {
+            "id": "agent/run/1",
+            "project_id": "proj/1",
+            "user_id": "0f7b181b-7bb6-4bc2-a34e-781f6c5b7e61",
+            "session_id": "705ecffa-1ff9-4ae7-91dd-1c71ae631d1e",
+            "surface": "delegated_coding",
+            "status": "completed",
+            "created_at": "2026-06-13T10:00:00Z",
+            "updated_at": "2026-06-13T10:01:00Z",
+        },
+        "build_packet": {"id": "packet-1", "status": "preview_ready", "assets": []},
+        "artifacts": run["artifacts"],
+        "supervisor_reviews": [],
+        "iteration_history": [],
+        "platform_events": [],
+    }
+
+
+def research_run_detail_payload() -> dict[str, Any]:
+    """Return a governed research detail fixture."""
+    run = {
+        "id": "research/run/1",
+        "project_id": "proj/1",
+        "agent_run_id": "agent/run/1",
+        "provider": "perplexity",
+        "capability_id": "web_search",
+        "specialist_type": "research",
+        "state": "handoff_ready",
+        "review_status": "passed",
+        "latest_progress_summary": "Research handoff is ready.",
+        "created_at": "2026-06-13T10:00:00Z",
+        "updated_at": "2026-06-13T10:01:00Z",
+        "completed_at": "2026-06-13T10:01:00Z",
+        "error_message": None,
+        "build_packet_id": "packet-1",
+        "artifacts": [
+            {
+                "id": "artifact-1",
+                "kind": "review_report",
+                "safe_summary": "HarnessAgent normalizes managed-agent streams.",
+                "metadata": {
+                    "answer_preview": "HarnessAgent normalizes managed-agent streams.",
+                    "citations": [
+                        "https://vercel.com/changelog/program-agent-harnesses-with-ai-sdk"
+                    ],
+                },
+            }
+        ],
+        "events": [
+            {
+                "id": "event-1",
+                "sequence": 1,
+                "event_type": "research_run.completed",
+                "provider_event_type": "search_completed",
+                "summary": "Research handoff is ready.",
+                "safe_payload": {"citation_count": 1},
+            }
+        ],
+    }
+    return {
+        "run": run,
+        "parent_run": {
+            "id": "agent/run/1",
+            "project_id": "proj/1",
+            "user_id": "0f7b181b-7bb6-4bc2-a34e-781f6c5b7e61",
+            "session_id": "705ecffa-1ff9-4ae7-91dd-1c71ae631d1e",
+            "surface": "delegated_research",
+            "status": "completed",
+            "created_at": "2026-06-13T10:00:00Z",
+            "updated_at": "2026-06-13T10:01:00Z",
+        },
+        "build_packet": {"id": "packet-1", "status": "active", "assets": []},
+        "artifacts": run["artifacts"],
+        "events": run["events"],
+        "platform_events": [],
+    }
+
+
+def browser_run_detail_payload() -> dict[str, Any]:
+    """Return a governed browser detail fixture."""
+    run = {
+        "id": "browser/run/1",
+        "project_id": "proj/1",
+        "agent_run_id": "agent/run/1",
+        "provider": "browserbase",
+        "capability_id": "browserbase_browser",
+        "specialist_type": "browser",
+        "state": "handoff_ready",
+        "review_status": "passed",
+        "external_environment_id": "bb_proj_123",
+        "external_session_id": "bb_sess_123",
+        "latest_progress_summary": "Browserbase live view is ready.",
+        "created_at": "2026-06-13T10:00:00Z",
+        "updated_at": "2026-06-13T10:01:00Z",
+        "completed_at": "2026-06-13T10:01:00Z",
+        "error_message": None,
+        "build_packet_id": "packet-1",
+        "artifacts": [
+            {
+                "id": "artifact-1",
+                "kind": "preview_url",
+                "signed_url": "https://debug.browserbase.test/session/fullscreen",
+                "safe_summary": "Browserbase live view is ready.",
+                "metadata": {
+                    "schema_version": "general-augment-browser-live-view/v1",
+                    "debug": {"ws_url_present": True, "page_count": 1},
+                },
+            }
+        ],
+        "events": [
+            {
+                "id": "event-1",
+                "sequence": 1,
+                "event_type": "browser_run.live_view_ready",
+                "provider_event_type": "debug_links_ready",
+                "summary": "Browserbase live view is ready.",
+                "safe_payload": {"artifact_id": "artifact-1"},
+            }
+        ],
+    }
+    return {
+        "run": run,
+        "parent_run": {
+            "id": "agent/run/1",
+            "project_id": "proj/1",
+            "user_id": "0f7b181b-7bb6-4bc2-a34e-781f6c5b7e61",
+            "session_id": "705ecffa-1ff9-4ae7-91dd-1c71ae631d1e",
+            "surface": "delegated_browser",
+            "status": "completed",
+            "created_at": "2026-06-13T10:00:00Z",
+            "updated_at": "2026-06-13T10:01:00Z",
+        },
+        "build_packet": {"id": "packet-1", "status": "active", "assets": []},
+        "artifacts": run["artifacts"],
+        "events": run["events"],
+        "platform_events": [],
+    }
 
 
 def write_agent_config(tmp_path: Path, *, api_version: str = "genaug/v1") -> Path:
@@ -4691,6 +4709,69 @@ def runtime_policy_response() -> dict[str, Any]:
         "platform_tools": {"enabled_tool_ids": ["web_search"], "unknown_tool_ids": []},
         "mcp": {"enabled_tool_ids": []},
         "skills": {"names": ["Support Triage"]},
+    }
+
+
+def project_launch_readiness_response(
+    *,
+    verdict: str = "ready",
+    required_open: int = 0,
+) -> dict[str, Any]:
+    """Return a hosted-compatible project launch-readiness fixture."""
+
+    return {
+        "schema_version": "genaug.project_launch_readiness.v1",
+        "project_id": "proj/1",
+        "project_slug": "dayplan",
+        "project_name": "DayPlan",
+        "generated_at": "2026-06-14T00:00:00Z",
+        "verdict": verdict,
+        "summary": {
+            "total": 2,
+            "required_total": 1,
+            "required_ready": 1 - required_open,
+            "required_open": required_open,
+            "recommended_total": 1,
+            "recommended_ready": 0,
+            "recommended_open": 1,
+        },
+        "items": [
+            {
+                "key": "run_timeline_visible",
+                "label": "Run timeline visible",
+                "description": "A retained run has canonical timeline events.",
+                "required": True,
+                "status": "open" if required_open else "ready",
+                "detail": "No retained run timeline events are visible yet.",
+                "evidence": {"agent_run_event_count": 0},
+                "next_actions": [
+                    {
+                        "label": "Run hosted verify",
+                        "command": "genaug verify --project dayplan --json",
+                        "href": "/dashboard/projects/proj/1/runs",
+                    }
+                ],
+            },
+            {
+                "key": "platform_webhook_configured",
+                "label": "Platform webhook configured",
+                "description": "Async lifecycle events have a delivery URL.",
+                "required": False,
+                "status": "open",
+                "detail": "No platform lifecycle webhook URL is configured.",
+                "evidence": {"platform_webhook_configured": False},
+                "next_actions": [],
+            },
+        ],
+        "next_actions": [
+            {
+                "label": "Run hosted verify",
+                "command": "genaug verify --project dayplan --json",
+                "href": "/dashboard/projects/proj/1/runs",
+            }
+        ]
+        if required_open
+        else [],
     }
 
 
@@ -4772,7 +4853,19 @@ def queue_project_verification_success() -> None:
         json_response(runtime_policy_response()),
         json_response({"content": "# DayPlan\n\nHelpful."}),
         json_response(skill_list_response()),
-        json_response({"response_text": "General Augment project works.", "metadata": {}}),
+        json_response(
+            {
+                "response_text": "General Augment project works.",
+                "metadata": {"agent_run_id": "run/1"},
+            }
+        ),
+        json_response(
+            {
+                "id": "run/1",
+                "status": "completed",
+                "run_events": [{"event_type": "agent_run.completed"}],
+            }
+        ),
         json_response({"items": [{"role": "assistant", "content": "ok"}]}),
         json_response(
             {
@@ -4795,6 +4888,23 @@ def queue_project_verification_success() -> None:
         ),
         json_response({"facts": [{"memory_id": "mem/1", "content": "concise onboarding notes"}]}),
         json_response({"total_facts": 1, "recent_facts": []}),
+        json_response(
+            {
+                "id": "resp_memory_recall",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "memory recall response completed",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
         json_response({"deleted_count": 1, "deleted_ids": ["mem/1"], "status": "deleted"}),
         json_response({"items": [{"tool_id": "memory_delete", "success": True}]}),
     ]

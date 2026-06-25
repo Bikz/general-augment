@@ -87,29 +87,32 @@ Every production request should include:
 ## 6. Bring Your Own Provider Capacity
 
 Production tenants should add their own model-provider keys in the dashboard or through
-the CLI. General Augment governs routing, traces, usage, memory, tools, and approvals;
-the tenant pays provider/API bills directly unless a separate commercial agreement says
-otherwise.
+the CLI. General Augment governs routing, traces, usage, memory, and tools; the tenant
+pays provider/API bills directly unless a separate commercial agreement says otherwise.
 
 ```bash
-genaug model-providers set openai \
+genaug providers setup --provider codex-mcp \
   --project my-agent \
-  --api-key "$OPENAI_API_KEY"
+  --api-key-env OPENAI_API_KEY \
+  --health-check
 
-genaug model-providers health openai --project my-agent --json
+genaug providers readiness --project my-agent --json
 ```
 
-Do not write provider keys to repo files, prompts, docs, screenshots, or artifacts.
+The named env var is read once, the credential is stored in General Augment custody, a
+health check runs, and only redacted setup evidence is written. Do not write provider
+keys to repo files, prompts, docs, screenshots, or artifacts.
 
 ## 7. Prove The Integration
 
 ```bash
 genaug verify --project my-agent --json
-genaug onboarding verify --project my-agent --json
 ```
 
-Return a clear `ready` or `blocked` verdict with exact failing command output when a
-coding agent implements the integration.
+`genaug verify` runs project acceptance checks (project keys, hosted agent test, tools,
+logs, usage, usage limits, observability, model routing, memory lifecycle, and tool-call
+audit) and prints dashboard URLs. Return a clear `ready` or `blocked` verdict with exact
+failing command output when a coding agent implements the integration.
 
 Next, use the [platform guide](platform-guide.md) for tools, memory, model providers,
-channels, approvals, observability, billing, and launch evidence.
+observability, and launch evidence.

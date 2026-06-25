@@ -2,71 +2,21 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
-READINESS_SCHEMA_VERSION = "general-augment-readiness/v1"
+_CONTRACT_PATH = Path(__file__).with_name("readiness_contract.json")
+_READINESS_CONTRACT = json.loads(_CONTRACT_PATH.read_text(encoding="utf-8"))
 
-READINESS_CHECKS: tuple[dict[str, str], ...] = (
+READINESS_SCHEMA_VERSION = str(_READINESS_CONTRACT["schema_version"])
+READINESS_CHECKS: tuple[dict[str, str], ...] = tuple(
     {
-        "key": "api_ready",
-        "label": "API ready",
-        "description": "Hosted API readiness returned healthy dependencies.",
-    },
-    {
-        "key": "project_created",
-        "label": "Project created",
-        "description": "The tenant project exists and can be resolved by the CLI.",
-    },
-    {
-        "key": "project_key_created",
-        "label": "Project key created",
-        "description": "At least one project-scoped server API key exists.",
-    },
-    {
-        "key": "project_key_execution",
-        "label": "Project key execution",
-        "description": "The configured project key can call /v1/responses.",
-    },
-    {
-        "key": "first_response_passed",
-        "label": "First response passed",
-        "description": "A hosted test turn completed successfully.",
-    },
-    {
-        "key": "tools_configured",
-        "label": "Tools configured",
-        "description": "The tool registry is reachable for this project.",
-    },
-    {
-        "key": "runtime_policy_visible",
-        "label": "Runtime policy visible",
-        "description": "Tenant model routing and Hermes-facing policy are visible.",
-    },
-    {
-        "key": "memory_tested",
-        "label": "Memory tested",
-        "description": "Memory store, search, profile, and delete checks passed.",
-    },
-    {
-        "key": "trace_visible",
-        "label": "Trace visible",
-        "description": "Observability returned trace rows for follow-up debugging.",
-    },
-    {
-        "key": "usage_limits_visible",
-        "label": "Usage limits visible",
-        "description": "Usage totals and plan limits are visible.",
-    },
-    {
-        "key": "channel_status_known",
-        "label": "Channel status known",
-        "description": "Channel readiness state is visible for the project.",
-    },
-    {
-        "key": "billing_state_known",
-        "label": "Billing state known",
-        "description": "The project exposes a billing or plan state.",
-    },
+        "key": str(item["key"]),
+        "label": str(item["label"]),
+        "description": str(item["description"]),
+    }
+    for item in _READINESS_CONTRACT["checks"]
 )
 
 CHECK_MAPPING: dict[str, tuple[str, ...]] = {
@@ -75,9 +25,12 @@ CHECK_MAPPING: dict[str, tuple[str, ...]] = {
     "project_key_created": ("project_api_key",),
     "project_key_execution": ("project_key_execution",),
     "first_response_passed": ("agent_test",),
+    "run_timeline_visible": ("run_timeline_inspect",),
     "tools_configured": ("tool_registry",),
     "runtime_policy_visible": ("runtime_policy_model_routing",),
+    "tenant_behavior_configured": (),
     "memory_tested": ("memory_store", "memory_search", "memory_profile", "memory_delete"),
+    "memory_response_recall": ("memory_response_recall",),
     "trace_visible": ("observability",),
     "usage_limits_visible": ("usage", "usage_limits"),
     "channel_status_known": ("channel_status",),
@@ -116,6 +69,35 @@ def _readiness_item(
         status = "PASS" if plan else "SKIP"
         detail = f"plan={plan}" if plan else "project plan or pricing tier is not exposed"
         return _item(definition, status, detail, source_checks=[])
+    if key == "tenant_behavior_configured":
+        prompt = str(project.get("system_prompt") or "").strip()
+        skills = project.get("skill_contents") or project.get("skills") or []
+        skill_count = len(skills) if isinstance(skills, list) else 0
+        soul_check = checks.get("soul_visible")
+        skills_check = checks.get("skills_visible")
+        prompt_specific = len(prompt) >= 80 and " ".join(prompt.lower().split()) not in {
+            "you are a helpful assistant.",
+            "you are a helpful assistant for this project.",
+            "you are a helpful agent.",
+        }
+        soul_visible = soul_check is not None and soul_check.get("status") == "PASS"
+        skills_visible = skills_check is not None and skills_check.get("status") == "PASS"
+        status = (
+            "PASS"
+            if prompt_specific or skill_count > 0 or soul_visible or skills_visible
+            else "SKIP"
+        )
+        detail = (
+            f"system_prompt_chars={len(prompt)}; project_skill_count={skill_count}"
+            if status == "PASS"
+            else "configure SOUL.md or add a project skill"
+        )
+        return _item(
+            definition,
+            status,
+            detail,
+            source_checks=["soul_visible", "skills_visible"],
+        )
 
     source_names = CHECK_MAPPING[key]
     source_checks = [checks.get(name) for name in source_names]

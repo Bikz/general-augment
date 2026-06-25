@@ -25,10 +25,12 @@ VALID_MODEL_PREFIXES = (
     "openai/",
 )
 TOOL_DISCOVERY_MODES = {"auto", "always", "direct"}
+APPROVAL_POLICY_MODES = {"tool_defaults", "risky_tools", "all_tools"}
 DEFAULT_TOOL_DISCOVERY: dict[str, Any] = {
     "mode": "auto",
     "direct_schema_tool_limit": 10,
     "max_search_results": 5,
+    "approval_policy": {"mode": "tool_defaults"},
     "native_hermes_toolsets": [],
     "allow_runtime_skill_writes": False,
     "hermes_runtime": {},
@@ -104,7 +106,7 @@ class LocalValidationResult:
     skill_count: int
     builtin_tools: list[str]
     mcp_servers: list[str]
-    tool_discovery: dict[str, int | str]
+    tool_discovery: dict[str, Any]
 
 
 def parse_openapi(spec_source: str) -> ParsedAPI:
@@ -211,7 +213,7 @@ def scaffold_basic_agent(
         encoding="utf-8",
     )
     (skills_dir / "README.md").write_text(
-        "# Skills\n\nAdd SKILL.md files here for repeatable tenant workflows.\n",
+        "# Skills\n\nAdd SKILL.md files here for repeatable customer workflows.\n",
         encoding="utf-8",
     )
     (tools_dir / "README.md").write_text(
@@ -678,14 +680,36 @@ def _validate_tool_discovery(value: object, errors: list[str]) -> dict[str, Any]
         value.get("hermes_runtime"),
         errors=errors,
     )
+    approval_policy = _validate_approval_policy(
+        value.get("approval_policy"),
+        errors=errors,
+    )
     return {
         "mode": mode,
         "direct_schema_tool_limit": direct_limit,
         "max_search_results": max_results,
+        "approval_policy": approval_policy,
         "native_hermes_toolsets": native_toolsets,
         "allow_runtime_skill_writes": allow_runtime_skill_writes,
         "hermes_runtime": hermes_runtime,
-    }
+}
+
+
+def _validate_approval_policy(value: object, *, errors: list[str]) -> dict[str, str]:
+    """Validate local approval policy config."""
+    if value is None:
+        return {"mode": "tool_defaults"}
+    if not isinstance(value, dict):
+        errors.append("behavior.tool_discovery.approval_policy must be an object.")
+        return {"mode": "tool_defaults"}
+    mode = str(value.get("mode") or "tool_defaults").casefold()
+    if mode not in APPROVAL_POLICY_MODES:
+        errors.append(
+            "behavior.tool_discovery.approval_policy.mode must be one of: "
+            "tool_defaults, risky_tools, all_tools."
+        )
+        mode = "tool_defaults"
+    return {"mode": mode}
 
 
 def _validate_hermes_runtime(value: object, *, errors: list[str]) -> dict[str, Any]:
@@ -961,6 +985,7 @@ def _agent_yaml(
                 "mode": "auto",
                 "direct_schema_tool_limit": 10,
                 "max_search_results": 5,
+                "approval_policy": {"mode": "risky_tools"},
             },
         },
         "welcome": {"message": f"Hi, I'm {display_name}. How can I help?"},
@@ -1041,7 +1066,7 @@ Implementation steps:
    genaug setup --capability browse --json
    genaug auth login --api-key "$GENAUG_API_KEY" --base-url "$GENAUG_API_BASE_URL"
    genaug doctor --json
-   genaug auth whoami
+   genaug auth whoami --json
 3. If the app already uses OpenAI Responses, generate a reviewable migration diff:
    genaug migrate openai-responses --dry-run --json
    # Apply only after review:

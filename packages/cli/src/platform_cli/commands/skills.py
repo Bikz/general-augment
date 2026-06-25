@@ -47,16 +47,18 @@ def design_skill(
     """Create an agent-friendly skill and prompt-flow design brief."""
     runtime: Runtime = ctx.obj
     bundle = _starter_skill_bundle(job_type)
+    skill = skill_design_recipe(job_type)
+    applied: dict[str, object] | None = None
     payload = {
         "schema_version": "general-augment-skill-design/v1",
         "workspace": str(workspace.expanduser().resolve()),
-        "skill": skill_design_recipe(job_type),
+        "skill": skill,
         "bundle": {
             "skill_name": bundle["skill_name"],
             "flow_id": bundle["flow_id"],
             "version_id": bundle["version_id"],
         },
-        "applied": None,
+        "applied": applied,
         "next_actions": [
             "Answer the skill questions with the app owner.",
             "Write or update the local SKILL.md and prompt-flow files.",
@@ -64,15 +66,15 @@ def design_skill(
         ],
     }
     if apply:
-        payload["applied"] = _push_starter_skill_bundle(
+        applied = _push_starter_skill_bundle(
             runtime,
             project=project,
             bundle=bundle,
         )
+        payload["applied"] = applied
     if json_output:
         print_json(payload)
         return
-    skill = payload["skill"]
     table(
         f"Skill design: {skill['name']}",
         ["Field", "Value"],
@@ -82,7 +84,7 @@ def design_skill(
             ["Questions", len(skill["questions"])],
         ],
     )
-    if payload["applied"]:
+    if applied:
         print_success("Applied starter skill and prompt-flow draft.")
 
 

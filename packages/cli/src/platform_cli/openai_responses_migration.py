@@ -27,7 +27,7 @@ def plan_openai_responses_migration(
     apply: bool,
     artifact_dir: Path,
 ) -> dict[str, Any]:
-    """Plan or apply safe OpenAI client config changes for Responses-compatible GA."""
+    """Plan or apply safe OpenAI client config changes for Responses-compatible General Augment."""
     root = workspace.expanduser().resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     patches: list[dict[str, Any]] = []
@@ -60,6 +60,7 @@ def plan_openai_responses_migration(
     # not just on --apply. Plan them the same way regardless of mode, but only
     # when an OpenAI client actually exists -- otherwise there is nothing to wire
     # to General Augment and we must not invent env churn.
+    env_patches: list[dict[str, Any]] = []
     if candidates:
         env_patches, env_diffs = _plan_env_files(root, apply=apply)
         patches.extend(env_patches)

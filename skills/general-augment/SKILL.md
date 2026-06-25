@@ -5,8 +5,8 @@ integration, or producing an agent-ready implementation plan.
 
 General Augment is the agent backend for an app. The app keeps its own auth, database,
 business rules, and UI. General Augment hosts the governed agent layer: `/v1/responses`,
-model routing, memory, tools, approvals, usage limits, traces, support bundles, channel
-delivery, and credential policy.
+model routing, memory, tools, approvals, usage limits, traces, support bundles, and
+credential policy.
 
 ## Fresh Docs First
 
@@ -36,7 +36,7 @@ behavior disagree, return `blocked` with the exact conflict instead of guessing.
 - Use stable app-owned user IDs in the `user` field so memory, traces, and usage map
   back to the app's identity system.
 - Prefer tenant-owned provider/API capacity. Store provider keys through the dashboard
-  or `genaug model-providers`; never put raw keys in prompts, repo files, docs, logs, or
+  or `genaug providers setup`; never put raw keys in prompts, repo files, docs, logs, or
   support artifacts.
 - Use idempotency keys for retryable turns.
 - Capture response IDs, request IDs, trace IDs, model/provider metadata, and usage
@@ -104,7 +104,6 @@ Run these before calling the work done:
 genaug doctor
 genaug smoke --project <project-slug> --evidence-output .genaug/smoke-evidence.json --json
 genaug verify --project <project-slug> --json
-genaug onboarding verify --project <project-slug> --json
 genaug dashboard open --project <project-slug>
 ```
 
@@ -118,7 +117,8 @@ test as the whole launch.
 ## Tools And Skills
 
 - Generate tools from OpenAPI with `genaug integrate`.
-- Keep destructive or expensive tools behind explicit approval policies.
+- Keep destructive or expensive tools behind explicit approval policies; disable them by
+  default with `genaug tools toggle <tool> --disable` until the owner accepts the risk.
 - Use MCP servers only when the app owner accepts the credential, network, and audit
   boundary.
 - Use `genaug connectors setup` for MCP connector write-through. Never store raw
@@ -133,8 +133,8 @@ test as the whole launch.
   shell, direct adapter commands, Apple IDs, phone numbers, message history, local paths,
   or connector tokens to the model, docs, logs, or support artifacts.
 - Use `genaug skills apply` for tenant-specific durable behavior instructions.
-- Verify enabled tools and skills with `genaug projects runtime-policy --json`,
-  `genaug tools list`, and `genaug skills list`.
+- Verify enabled tools and skills with `genaug tools list`, `genaug tools discovery`,
+  and `genaug skills list`.
 
 Useful commands:
 
@@ -143,11 +143,9 @@ genaug integrate ./openapi.yaml --name <project-slug> --auto-deploy
 genaug connectors setup --name browserbase --project <project-slug> \
   --url 'https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}' \
   --health-check
-genaug projects runtime-policy --project <project-slug> --json
 genaug tools list --project <project-slug>
 genaug tools discovery --project <project-slug> --json
-genaug projects runtime-policy --project <project-slug> --json
-genaug mcp list --project <project-slug>
+genaug tools add-mcp github --project <project-slug> --url https://example.com/mcp
 genaug skills list --project <project-slug>
 ```
 
@@ -156,55 +154,72 @@ genaug skills list --project <project-slug>
 - Store durable user facts only when they improve the app experience.
 - Do not store secrets, raw payment details, authentication tokens, or regulated data
   unless the launch scope explicitly approves it.
-- Prove memory behavior with `genaug memory store`, `genaug memory search`,
-  `genaug memory profile`, and user purge/delete commands when relevant.
+- Memory is called from backend SDK code, not a CLI command. Prove memory behavior with
+  the SDK methods `store_memory`, `search_memory`, `memory_profile`, and
+  `delete_memory` / `purge_user_memory` when relevant.
+
+```python
+client.store_memory(
+    {"user_id": "app-user-123", "fact": "User prefers concise updates", "fact_type": "preference"}
+)
+client.search_memory({"user_id": "app-user-123", "query": "updates"})
+client.memory_profile("app-user-123")
+client.purge_user_memory("app-user-123")
+```
 
 ## Model Providers
 
 - Prefer tenant-owned provider keys for production traffic.
-- Use dashboard provider setup, `genaug providers setup`, or `genaug model-providers set`.
+- Use dashboard provider setup or `genaug providers setup`.
 - Verify provider attribution before claiming tenant-owned capacity works.
 
 ```bash
 genaug providers setup --capability browse --project <project-slug> --health-check
-genaug model-providers list --project <project-slug>
-genaug model-providers health <provider> --project <project-slug> --json
+genaug providers smoke --provider <provider> --project <project-slug> --json
+genaug providers readiness --project <project-slug> --json
 ```
 
-## Identity And Channels
+## Identity
 
 - Keep the app's identity system as source of truth.
-- Map external channel identities back to stable app user IDs.
-- Verify channel status before sending real user traffic.
+- Map external channel identities back to stable app user IDs. Identity linking is
+  called from backend SDK code, not a CLI command.
 
-```bash
-genaug identity list --project <project-slug>
-genaug channels status --project <project-slug>
-genaug channels test telegram --project <project-slug>
+```python
+client.link_user(
+    "project_123",
+    phone="+15555550123",
+    app_user_id="app-user-123",
+    provider_name="app",
+)
+client.resolve_user("project_123", "+15555550123")
+client.unlink_user("project_123", "+15555550123")
 ```
 
 ## Observability, Usage, And Billing
 
-- Capture trace IDs, support bundles, usage, and stable error reasons.
+- Capture trace IDs, support bundles, usage, and stable error reasons through the smoke
+  evidence artifact.
 - Provider bills normally stay with the tenant's provider account unless a separate
   commercial agreement says otherwise.
 - Do not treat usage events as an invoice by themselves.
 
 ```bash
-genaug logs --project <project-slug>
 genaug smoke --project <project-slug> --include-support-bundle --evidence-output artifacts/smoke-evidence.json --json
-genaug observability trace <trace-id> --project <project-slug> --json
-genaug observability support-bundle --project <project-slug> --json
-genaug projects usage --project <project-slug> --json
-genaug billing events --project <project-slug> --json
+genaug verify --project <project-slug> --json
 ```
+
+The SDK `usage` helper reports usage totals from backend code when you need them
+programmatically.
 
 ## Local Mock
 
-Use the mock for CI and contract tests when hosted credentials are unavailable:
+Use the mock for CI and contract tests when hosted credentials are unavailable. It ships
+with the CLI package and runs as a Python module (not a `genaug` subcommand):
 
 ```bash
-genaug mock --host 127.0.0.1 --port 8787 --quiet
+uv run --project packages/cli python -m platform_cli.local_mock \
+  --host 127.0.0.1 --port 8787 --quiet
 ```
 
 ## Output Contract For Coding Agents
@@ -213,8 +228,8 @@ End with one of:
 
 - `ready`: include install commands, files changed, smoke/verify artifacts, and the
   production URL or API path tested. Mention which platform surfaces were actually
-  verified: responses, model providers, tools, skills, memory, channels, observability,
-  approvals, billing, and usage.
+  verified: responses, model providers, tools, skills, memory, identity, observability,
+  and usage.
 - `blocked`: include the exact missing secret/config/account/permission, the command
   that failed, and the next unblock action.
 

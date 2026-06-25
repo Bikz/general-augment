@@ -1,8 +1,13 @@
+<!-- AUTO-GENERATED MIRROR — DO NOT EDIT. Source: private monorepo. See MIRROR.md. -->
+> **Generated, read-only mirror.** This repository is auto-generated from the private
+> General Augment monorepo. Do not edit directly (changes are overwritten). Issues are
+> welcome; PRs are not accepted here. See [MIRROR.md](./MIRROR.md).
+
 # General Augment
 
 General Augment is the agent backend for your app. Use one hosted
-Responses-compatible API to add model routing, memory, tools, approvals, usage limits,
-traces, governed local connectors, and support receipts to your product.
+Responses-compatible API to add model routing, memory, tools, usage limits, traces,
+and governed local connectors to your product.
 
 This repository contains the public SDKs, CLI, examples, and agent-integration guidance.
 The hosted API and product docs live at:
@@ -141,15 +146,14 @@ genaug migrate openai-responses --dry-run --json
 genaug providers setup --capability browse --project my-agent --api-key-env BROWSERBASE_API_KEY --health-check
 genaug connectors setup --name browserbase --url 'https://mcp.browserbase.com/mcp?api_key=${{ providers.browserbase.api_key }}' --health-check
 genaug skills design --job-type website-builder --project my-agent --apply
-genaug doctor
-genaug projects list
 genaug init my-agent --tool web_search
+genaug integrate https://petstore3.swagger.io/api/v3/openapi.json --auto-deploy
 genaug validate ./my-agent/genaug-agent.yaml
-genaug deploy ./my-agent/genaug-agent.yaml
-genaug model-providers set openai --project my-agent --api-key "$OPENAI_API_KEY"
+genaug doctor
+genaug status --json
 genaug smoke --project my-agent --evidence-output .genaug/smoke-evidence.json --json
 genaug verify --project my-agent --json
-genaug onboarding verify --project my-agent --json
+genaug dashboard open --project my-agent
 ```
 
 ## License
