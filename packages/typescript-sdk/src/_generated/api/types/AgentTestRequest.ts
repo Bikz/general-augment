@@ -4,6 +4,7 @@
  * Payload for testing an agent without a live channel.
  */
 export interface AgentTestRequest {
+    agent_id?: (string | null) | undefined;
     channel?: string | undefined;
     message: string;
     phone_e164?: string | undefined;

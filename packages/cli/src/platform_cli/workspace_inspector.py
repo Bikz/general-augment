@@ -46,6 +46,12 @@ def inspect_workspace(workspace: Path) -> dict[str, Any]:
     code_files = _iter_files(root, SCAN_EXTENSIONS)
     responses_call_sites = _responses_call_sites(root, code_files)
     prompt_files = _prompt_files(root)
+    auth = _detect_auth(root, package_json, code_files)
+    stable_user_candidates = _stable_user_candidates(root, code_files)
+    backend_boundaries = _backend_boundaries(root, code_files)
+    assistant_surfaces = _assistant_surfaces(root, code_files)
+    api_descriptions = _api_descriptions(root)
+    test_commands = _test_commands(package_json)
     return {
         "workspace": {
             "root": str(root),
@@ -66,8 +72,205 @@ def inspect_workspace(workspace: Path) -> dict[str, Any]:
             "prompts": prompt_files,
             "webhooks": _matching_paths(root, code_files, "webhook"),
             "tools": _matching_paths(root, code_files, "tool"),
+            "language": _detect_language(package_json, pyproject_text),
+            "auth": auth,
+            "stable_user_candidates": stable_user_candidates,
+            "backend_boundaries": backend_boundaries,
+            "assistant_surfaces": assistant_surfaces,
+            "api_descriptions": api_descriptions,
+            "deployment_provider": _deployment_provider(root),
+            "environment_variables": _all_env_vars(root),
+            "test_commands": test_commands,
+            "risks": _inspection_risks(auth, stable_user_candidates, backend_boundaries),
         },
     }
+
+
+def _detect_language(package_json: dict[str, Any], pyproject_text: str) -> list[str]:
+    languages: list[str] = []
+    dependencies = _package_dependencies(package_json)
+    if "typescript" in dependencies or package_json:
+        languages.append("typescript" if "typescript" in dependencies else "javascript")
+    if pyproject_text:
+        languages.append("python")
+    return languages or ["unknown"]
+
+
+def _detect_auth(
+    root: Path,
+    package_json: dict[str, Any],
+    code_files: list[Path],
+) -> dict[str, Any]:
+    dependencies = _package_dependencies(package_json)
+    provider = "unknown"
+    evidence: list[dict[str, str]] = []
+    dependency_candidates = (
+        ("clerk", ("@clerk/nextjs", "@clerk/clerk-react")),
+        ("authjs", ("next-auth", "@auth/core")),
+        ("supabase", ("@supabase/ssr", "@supabase/supabase-js")),
+    )
+    for candidate, packages in dependency_candidates:
+        installed = next((name for name in packages if name in dependencies), None)
+        if installed:
+            provider = candidate
+            evidence.append({"kind": "dependency", "value": installed})
+            break
+    patterns = {
+        "clerk": ("auth()", "currentUser(", "clerkMiddleware("),
+        "authjs": ("getServerSession(", "NextAuth(", "auth("),
+        "supabase": ("createServerClient(", "supabase.auth.getUser("),
+    }
+    for path in code_files:
+        text = _safe_read(path)
+        for candidate, needles in patterns.items():
+            if any(needle in text for needle in needles):
+                if provider == "unknown":
+                    provider = candidate
+                if candidate == provider and len(evidence) < 12:
+                    evidence.append(
+                        {"kind": "server_usage", "file": str(path.relative_to(root))}
+                    )
+                break
+    return {"provider": provider, "server_side_evidence": evidence}
+
+
+def _stable_user_candidates(root: Path, code_files: list[Path]) -> list[dict[str, Any]]:
+    patterns = (
+        ("clerk_user_id", ("userId", "auth().userId")),
+        ("session_user_id", ("session.user.id", "session?.user?.id")),
+        ("supabase_user_id", ("user.id", "user?.id")),
+    )
+    candidates: list[dict[str, Any]] = []
+    for path in code_files:
+        lines = _safe_read(path).splitlines()
+        for line_number, line in enumerate(lines, start=1):
+            for source, needles in patterns:
+                if any(needle in line for needle in needles):
+                    candidates.append(
+                        {
+                            "source": source,
+                            "file": str(path.relative_to(root)),
+                            "line": line_number,
+                            "server_side": _server_side_path(path.relative_to(root)),
+                        }
+                    )
+                    break
+            if len(candidates) >= 30:
+                return candidates
+    return candidates
+
+
+def _server_side_path(relative: Path) -> bool:
+    value = "/".join(relative.parts).lower()
+    return any(
+        marker in value
+        for marker in ("/api/", "route.", "server", "action", "middleware", "lib/auth")
+    )
+
+
+def _backend_boundaries(root: Path, code_files: list[Path]) -> list[dict[str, str]]:
+    boundaries: list[dict[str, str]] = []
+    for path in code_files:
+        relative = path.relative_to(root)
+        value = "/".join(relative.parts).lower()
+        kind = None
+        if "/api/" in value and path.stem == "route":
+            kind = "next_route_handler"
+        elif "actions" in relative.parts or "action" in path.stem.lower():
+            kind = "server_action"
+        elif any(part in {"server", "services", "service"} for part in relative.parts):
+            kind = "server_service"
+        if kind:
+            boundaries.append({"file": str(relative), "kind": kind})
+        if len(boundaries) >= 50:
+            break
+    return boundaries
+
+
+def _assistant_surfaces(root: Path, code_files: list[Path]) -> list[dict[str, str]]:
+    markers = ("chat", "assistant", "copilot", "agent")
+    ranked: list[tuple[int, str, dict[str, str]]] = []
+    for path in code_files:
+        relative = path.relative_to(root)
+        if _is_test_source(relative):
+            continue
+        value = "/".join(relative.parts).lower()
+        if any(marker in value for marker in markers):
+            browser_surface = path.suffix.lower() in {".jsx", ".tsx"} and "/api/" not in value
+            ranked.append(
+                (
+                    0 if browser_surface else 1,
+                    str(relative),
+                    {
+                        "file": str(relative),
+                        "kind": "in_app_assistant" if browser_surface else "backend_candidate",
+                    },
+                )
+            )
+    return [item for _, _, item in sorted(ranked)[:30]]
+
+
+def _is_test_source(relative: Path) -> bool:
+    """Exclude tests and stories from product integration-point detection."""
+    filename = relative.name.lower()
+    return (
+        any(part.lower() in {"__tests__", "test", "tests"} for part in relative.parts[:-1])
+        or any(marker in filename for marker in (".test.", ".spec.", ".stories."))
+    )
+
+
+def _api_descriptions(root: Path) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    for pattern, kind in (
+        ("**/openapi*.json", "openapi"),
+        ("**/openapi*.yaml", "openapi"),
+        ("**/openapi*.yml", "openapi"),
+    ):
+        for path in sorted(root.glob(pattern)):
+            if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+                continue
+            candidates.append({"file": str(path.relative_to(root)), "kind": kind})
+    return candidates[:20]
+
+
+def _deployment_provider(root: Path) -> str:
+    if (root / "vercel.json").exists() or any(root.glob("next.config.*")):
+        return "vercel_compatible"
+    if (root / "netlify.toml").exists():
+        return "netlify"
+    if (root / "Dockerfile").exists():
+        return "container"
+    return "unknown"
+
+
+def _all_env_vars(root: Path) -> list[str]:
+    values: set[str] = set()
+    for item in _env_files(root):
+        values.update(str(key) for key in item["keys"])
+    return sorted(values)
+
+
+def _test_commands(package_json: dict[str, Any]) -> list[str]:
+    scripts = package_json.get("scripts")
+    if not isinstance(scripts, dict):
+        return []
+    preferred = ("test", "typecheck", "lint", "build", "test:e2e", "e2e")
+    return [f"npm run {name}" for name in preferred if isinstance(scripts.get(name), str)]
+
+
+def _inspection_risks(
+    auth: dict[str, Any],
+    stable_user_candidates: list[dict[str, Any]],
+    backend_boundaries: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    risks: list[dict[str, str]] = []
+    if auth.get("provider") == "unknown":
+        risks.append({"code": "auth_provider_unknown", "severity": "blocking"})
+    if not any(item.get("server_side") for item in stable_user_candidates):
+        risks.append({"code": "stable_server_user_id_unresolved", "severity": "blocking"})
+    if not backend_boundaries:
+        risks.append({"code": "backend_integration_point_unresolved", "severity": "warning"})
+    return risks
 
 
 def _load_package_json(path: Path) -> dict[str, Any]:

@@ -48,6 +48,7 @@ class PlatformClient:
         *,
         json: Mapping[str, Any] | None = None,
         params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> Any:
         """Call an admin API endpoint."""
         if not self.config.api_key:
@@ -57,6 +58,7 @@ class PlatformClient:
             f"{ADMIN_PREFIX}{path}",
             json=json,
             params=params,
+            extra_headers=headers,
             authenticated=True,
         )
 
@@ -76,6 +78,7 @@ class PlatformClient:
         path: str,
         *,
         json: Mapping[str, Any] | None = None,
+        params: Mapping[str, Any] | None = None,
         token: str | None = None,
     ) -> Any:
         """Call an installer-auth endpoint."""
@@ -84,6 +87,7 @@ class PlatformClient:
             method,
             f"/api/v1/installer{path}",
             json=json,
+            params=params,
             extra_headers=headers,
             authenticated=False,
         )
@@ -116,9 +120,14 @@ class PlatformClient:
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> Any:
-        """Call an app-facing endpoint using bearer auth."""
-        if not self.config.api_key:
-            raise CLIError("No API key configured. Run genaug auth login first.")
+        """Call an app-facing endpoint using explicit runtime auth when available.
+
+        ``api_key`` remains a fallback for pre-0.3 configurations. It is never
+        promoted to installer or management authority.
+        """
+        key = self.config.runtime_api_key or self.config.api_key
+        if not key:
+            raise CLIError("No application runtime key configured. Run genaug launch --provision.")
         return self._request(
             method,
             path,
@@ -127,6 +136,34 @@ class PlatformClient:
             extra_headers=headers,
             authenticated=True,
             auth_mode="bearer",
+            auth_key=key,
+        )
+
+    def runtime_app(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Mapping[str, Any] | None = None,
+        params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        """Call an app endpoint and refuse ambiguous legacy credentials."""
+        key = self.config.runtime_api_key
+        if not key:
+            raise CLIError(
+                "No explicit application runtime key configured. "
+                "Re-run genaug launch --provision."
+            )
+        return self._request(
+            method,
+            path,
+            json=json,
+            params=params,
+            extra_headers=headers,
+            authenticated=True,
+            auth_mode="bearer",
+            auth_key=key,
         )
 
     def app_event_stream(
@@ -137,10 +174,11 @@ class PlatformClient:
         headers: Mapping[str, str] | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Stream semantic SSE events from an app-facing endpoint."""
-        if not self.config.api_key:
-            raise CLIError("No API key configured. Run genaug auth login first.")
+        key = self.config.runtime_api_key or self.config.api_key
+        if not key:
+            raise CLIError("No application runtime key configured. Run genaug launch --provision.")
         request_headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
+            "Authorization": f"Bearer {key}",
             **dict(headers or {}),
         }
         try:
@@ -163,6 +201,45 @@ class PlatformClient:
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
             raise CLIError(f"Could not reach the platform API at {self.base_url}: {exc}") from exc
 
+    def runtime_response_event_stream(
+        self,
+        *,
+        json: Mapping[str, Any],
+        headers: Mapping[str, str] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """POST one Responses request and yield SSE events using runtime auth only."""
+        key = self.config.runtime_api_key
+        if not key:
+            raise CLIError(
+                "No explicit application runtime key configured. "
+                "Re-run genaug launch --provision."
+            )
+        request_headers = {
+            "Authorization": f"Bearer {key}",
+            "Accept": "text/event-stream",
+            **dict(headers or {}),
+        }
+        body = {**dict(json), "stream": True}
+        try:
+            with self._client.stream(
+                "POST",
+                f"{self.base_url}/v1/responses",
+                headers=request_headers,
+                json=body,
+            ) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise APIError(
+                        response.status_code,
+                        _error_detail(response),
+                        response.headers,
+                        request_path="/v1/responses",
+                        auth_mode="bearer",
+                    )
+                yield from _iter_sse_events(response.iter_lines())
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
+            raise CLIError(f"Could not reach the platform API at {self.base_url}: {exc}") from exc
+
     def _request(
         self,
         method: str,
@@ -173,14 +250,16 @@ class PlatformClient:
         extra_headers: Mapping[str, str] | None = None,
         authenticated: bool,
         auth_mode: str = "admin",
+        auth_key: str | None = None,
     ) -> Any:
         """Send one request and decode the response."""
         headers: dict[str, str] = {}
-        if authenticated and self.config.api_key:
+        credential = auth_key or self.config.api_key
+        if authenticated and credential:
             if auth_mode == "bearer":
-                headers["Authorization"] = f"Bearer {self.config.api_key}"
+                headers["Authorization"] = f"Bearer {credential}"
             else:
-                headers["X-Admin-Key"] = self.config.api_key
+                headers["X-Admin-Key"] = credential
         headers.update(dict(extra_headers or {}))
         try:
             response = self._client.request(

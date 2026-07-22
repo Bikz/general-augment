@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -27,7 +27,19 @@ class CLIConfig(BaseModel):
     """Persisted CLI configuration."""
 
     base_url: str = DEFAULT_BASE_URL
+    # Deprecated compatibility field for management API keys. Runtime credentials
+    # must never be written here.
     api_key: str | None = None
+    runtime_api_key: str | None = None
+    runtime_key_id: str | None = None
+    runtime_key_project_id: str | None = None
+    runtime_key_scopes: list[str] = Field(default_factory=list)
+    runtime_key_mode: Literal["test", "live"] | None = None
+    release_preview_binding_id: str | None = None
+    release_preview_release_id: str | None = None
+    release_preview_fingerprint: str | None = None
+    release_preview_expires_at: str | None = None
+    active_workspace: str | None = None
     active_project: str | None = None
     profile: str = "default"
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -98,12 +110,8 @@ def apply_runtime_overrides(
                 or os.getenv("GENAUG_API_BASE_URL")
                 or config.base_url
             ),
-            "api_key": (
-                api_key
-                or os.getenv("GENAUG_ADMIN_API_KEY")
-                or os.getenv("GENAUG_API_KEY")
-                or config.api_key
-            ),
+            "api_key": (api_key or os.getenv("GENAUG_ADMIN_API_KEY") or config.api_key),
+            "runtime_api_key": os.getenv("GENAUG_API_KEY") or config.runtime_api_key,
         }
     )
 

@@ -31,6 +31,9 @@ class RawResponsesClient:
         self,
         *,
         model: str,
+        agent_id: typing.Optional[str] = None,
+        deployment_id: typing.Optional[str] = None,
+        agent: typing.Optional[str] = OMIT,
         background: typing.Optional[bool] = OMIT,
         conversation: typing.Optional[str] = OMIT,
         include: typing.Optional[typing.Sequence[str]] = OMIT,
@@ -60,6 +63,12 @@ class RawResponsesClient:
         Parameters
         ----------
         model : str
+
+        agent_id : typing.Optional[str]
+
+        deployment_id : typing.Optional[str]
+
+        agent : typing.Optional[str]
 
         background : typing.Optional[bool]
 
@@ -115,6 +124,7 @@ class RawResponsesClient:
             "v1/responses",
             method="POST",
             json={
+                "agent": agent,
                 "background": background,
                 "conversation": conversation,
                 "include": include,
@@ -142,6 +152,8 @@ class RawResponsesClient:
             },
             headers={
                 "content-type": "application/json",
+                "X-Agent-ID": str(agent_id) if agent_id is not None else None,
+                "X-Deployment-ID": str(deployment_id) if deployment_id is not None else None,
             },
             request_options=request_options,
             omit=OMIT,
@@ -196,6 +208,9 @@ class AsyncRawResponsesClient:
         self,
         *,
         model: str,
+        agent_id: typing.Optional[str] = None,
+        deployment_id: typing.Optional[str] = None,
+        agent: typing.Optional[str] = OMIT,
         background: typing.Optional[bool] = OMIT,
         conversation: typing.Optional[str] = OMIT,
         include: typing.Optional[typing.Sequence[str]] = OMIT,
@@ -225,6 +240,12 @@ class AsyncRawResponsesClient:
         Parameters
         ----------
         model : str
+
+        agent_id : typing.Optional[str]
+
+        deployment_id : typing.Optional[str]
+
+        agent : typing.Optional[str]
 
         background : typing.Optional[bool]
 
@@ -280,6 +301,7 @@ class AsyncRawResponsesClient:
             "v1/responses",
             method="POST",
             json={
+                "agent": agent,
                 "background": background,
                 "conversation": conversation,
                 "include": include,
@@ -307,6 +329,8 @@ class AsyncRawResponsesClient:
             },
             headers={
                 "content-type": "application/json",
+                "X-Agent-ID": str(agent_id) if agent_id is not None else None,
+                "X-Deployment-ID": str(deployment_id) if deployment_id is not None else None,
             },
             request_options=request_options,
             omit=OMIT,

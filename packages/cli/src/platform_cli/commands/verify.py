@@ -14,6 +14,11 @@ from platform_cli.errors import CLIError
 from platform_cli.output import panel, print_json, table
 from platform_cli.readiness import build_readiness_checklist
 from platform_cli.runtime import Runtime
+from platform_cli.self_serve import (
+    dashboard_observability_url,
+    dashboard_project_section_url,
+    dashboard_project_url,
+)
 
 
 def verify(
@@ -577,16 +582,12 @@ def _runtime_policy_artifact(payload: object) -> dict[str, Any]:
 
 def _dashboard_links(dashboard_url: str, project_id: str) -> dict[str, str]:
     """Build dashboard URLs for UI follow-up checks."""
-
-    base = dashboard_url.rstrip("/")
-    encoded = encode_path_segment(project_id)
-    project_root = f"{base}/dashboard/projects/{encoded}"
     return {
-        "project": project_root,
-        "integrate": f"{project_root}/integrate",
-        "tools": f"{project_root}/tools",
-        "observability": f"{project_root}/observability",
-        "analytics": f"{project_root}/analytics",
+        "project": dashboard_project_url(project_id, base_url=dashboard_url),
+        "integrate": dashboard_project_section_url(project_id, "integrate", base_url=dashboard_url),
+        "tools": dashboard_project_section_url(project_id, "tools", base_url=dashboard_url),
+        "observability": dashboard_observability_url(project=project_id, base_url=dashboard_url),
+        "analytics": dashboard_project_section_url(project_id, "analytics", base_url=dashboard_url),
     }
 
 
@@ -603,7 +604,7 @@ def _run_memory_lifecycle(
     recall_marker = f"genaug-memory-verify-{verification_id}"
     fact = (
         "CLI verification user prefers concise onboarding notes. "
-        f"The user's private verification marker is {recall_marker}."
+        f"Their onboarding note code is {recall_marker}."
     )
     checks: list[dict[str, str]] = []
 
@@ -699,8 +700,8 @@ def _run_memory_response_recall(
                 "model": "balanced",
                 "user": user,
                 "input": (
-                    "What is my stored CLI verification memory marker? "
-                    "Reply with only the marker."
+                    "What is my stored onboarding note code? "
+                    "Reply with only the code."
                 ),
                 "metadata": {
                     "source": "genaug-cli-verify",
@@ -718,9 +719,10 @@ def _run_memory_response_recall(
     text = _response_text(response)
     if recall_marker.lower() in text.lower():
         return _check("memory_response_recall", True, response_id or "marker recalled")
-    return _skip(
+    return _check(
         "memory_response_recall",
-        response_id or status or "response completed but marker was not found",
+        False,
+        response_id or status or "response completed but the onboarding note code was not found",
     )
 
 

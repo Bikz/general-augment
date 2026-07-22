@@ -12,6 +12,7 @@ from platform_cli.errors import CLIError
 from platform_cli.output import print_json, print_success, table
 from platform_cli.runtime import Runtime
 from platform_cli.self_serve import (
+    installer_access_token,
     installer_auth_metadata,
     resolve_installer_project_id,
     skill_design_recipe,
@@ -201,9 +202,10 @@ def _push_starter_skill_bundle(
     if not project_ref:
         raise CLIError("Pass --project or run genaug setup --bootstrap first.")
     installer = installer_auth_metadata(runtime.config)
+    token = installer_access_token(runtime) if installer is not None else None
     with runtime.client() as client:
         if installer is not None:
-            token = str(installer["access_token"])
+            assert token is not None
             project_id = resolve_installer_project_id(
                 client, token=token, project_ref=str(project_ref)
             )

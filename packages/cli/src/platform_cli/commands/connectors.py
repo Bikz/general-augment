@@ -12,7 +12,11 @@ from platform_cli.client import encode_path_segment, resolve_project
 from platform_cli.errors import CLIError
 from platform_cli.output import print_json, table
 from platform_cli.runtime import Runtime
-from platform_cli.self_serve import connector_setup_recipes, installer_auth_metadata
+from platform_cli.self_serve import (
+    connector_setup_recipes,
+    installer_access_token,
+    installer_auth_metadata,
+)
 
 app = typer.Typer(help="Plan app connector setup.")
 
@@ -156,9 +160,10 @@ def _configure_mcp_connector(
         connector_payload["connect_timeout"] = connect_timeout
 
     installer = installer_auth_metadata(runtime.config)
+    token = installer_access_token(runtime) if installer is not None else None
     with runtime.client() as client:
         if installer is not None:
-            token = str(installer["access_token"])
+            assert token is not None
             project_id = str(project_ref)
             server = client.installer(
                 "POST",

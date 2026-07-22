@@ -2,22 +2,51 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import socket
+import subprocess
+import time
 import tomllib
 import urllib.request
 from collections.abc import Iterator
+from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
 import httpx
 import pytest
+import typer
 import yaml
 from typer.testing import CliRunner
 
+from platform_cli.client import PlatformClient
 from platform_cli.commands import auth as auth_command
-from platform_cli.errors import helpful_api_error
+from platform_cli.commands.launch import (
+    _launch_artifact,
+    _matching_launch_runtime_keys,
+    _release_intent,
+    _server_release_check,
+)
+from platform_cli.commands.setup import _select_or_create_project
+from platform_cli.config import CLIConfig
+from platform_cli.errors import CLIError, helpful_api_error
+from platform_cli.launch_contract import build_launch_manifest, write_launch_manifest
+from platform_cli.launch_verification import (
+    REQUIRED_BETA_CHECKS,
+    launch_session_fingerprint,
+    manifest_fingerprint,
+)
 from platform_cli.main import app
+from platform_cli.runtime import Runtime
+from platform_cli.self_serve import (
+    dashboard_observability_url,
+    dashboard_project_url,
+    installer_access_token,
+)
+from platform_cli.workspace_inspector import inspect_workspace
 
 ROOT = Path(__file__).resolve().parents[3]
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -69,11 +98,12 @@ class FakeHTTPClient:
         url: str,
         *,
         headers: dict[str, str] | None = None,
+        json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ) -> _FakeStreamResponse:
         """Capture streaming request data and return queued SSE response."""
         self.requests.append(
-            {"method": method, "url": url, "headers": headers or {}, "json": None, "params": params}
+            {"method": method, "url": url, "headers": headers or {}, "json": json, "params": params}
         )
         response = self.queue.pop(0) if self.queue else json_response({})
         response.request = httpx.Request(method, url)
@@ -210,6 +240,943 @@ def test_auth_login_logout_whoami(tmp_path: Path) -> None:
     assert not config_path.exists()
 
 
+def test_launch_provision_separates_authority_reuses_key_and_writes_ignored_env(
+    tmp_path: Path,
+) -> None:
+    """Provision must use installer auth for config and runtime auth only for the app."""
+    workspace = tmp_path / "habit-app"
+    route = workspace / "app" / "api" / "assistant"
+    route.mkdir(parents=True)
+    (workspace / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "15.5.18", "@clerk/nextjs": "7.2.4"}}),
+        encoding="utf-8",
+    )
+    (route / "route.ts").write_text(
+        "import { auth } from '@clerk/nextjs/server';\nexport async function POST() { "
+        "const { userId } = await auth(); return Response.json({ userId }); }\n",
+        encoding="utf-8",
+    )
+    (workspace / ".gitignore").write_text(".env.local\n.genaug/\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "api_key": "legacy-management-key",
+                "active_project": "project-1",
+                "metadata": {"installer": {"access_token": "gainst_installer_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    plan = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--plan",
+            "--json",
+        ],
+    )
+    assert plan.exit_code == 0, plan.output
+    session_id = json.loads(plan.output)["session_id"]
+    runtime_key_row = {
+        "id": "key-1",
+        "name": "General Augment launch preview",
+        "masked_key": "ga...cret",
+        "project_id": "project-1",
+        "scopes": ["responses:create"],
+        "runtime_mode": "test",
+        "preview_binding_id": "binding-1",
+        "expires_at": "2099-07-13T13:00:00Z",
+        "created_at": "2026-07-13T12:00:00Z",
+    }
+    approved = {
+        "session_id": session_id,
+        "status": "approved",
+        "fingerprint": "f" * 64,
+    }
+    release_row = {
+        "id": "release-1",
+        "project_id": "project-1",
+        "status": "candidate",
+        "fingerprint": "e" * 64,
+    }
+    FakeHTTPClient.queue = [
+        json_response({"items": [{"id": "project-1", "slug": "habit-app", "name": "Habit"}]}),
+        json_response(approved),
+        json_response({"id": "project-1", "slug": "habit-app", "name": "Habit"}),
+        json_response(release_row),
+        json_response({"items": []}),
+        json_response(
+            {
+                "binding_id": "binding-1",
+                "release_id": "release-1",
+                "runtime_key_id": "key-1",
+                "runtime_api_key": "ga_runtime_secret_once",
+                "expires_at": "2099-07-13T13:00:00Z",
+            }
+        ),
+        json_response({"items": [runtime_key_row]}),
+    ]
+    args = [
+        "--config",
+        str(config_path),
+        "launch",
+        "--workspace",
+        str(workspace),
+        "--provision",
+        "--approve-session",
+        session_id,
+        "--configure-application-env",
+        "--json",
+    ]
+
+    first = runner.invoke(app, args)
+
+    assert first.exit_code == 0, first.output
+    assert "ga_runtime_secret_once" not in first.output
+    first_payload = json.loads(first.output)
+    assert first_payload["runtime_key"]["action"] == "created"
+    assert first_payload["runtime_key"]["active_matching_count"] == 1
+    assert first_payload["control_plane_authority"] == "installer"
+    assert first_payload["application_authority"] == "runtime_api_key"
+    assert first_payload["release"] == {
+        "id": "release-1",
+        "fingerprint": "e" * 64,
+        "status": "candidate",
+        "intent": "test",
+    }
+    assert all("/api/v1/admin" not in request["url"] for request in FakeHTTPClient.requests)
+    config_request = next(
+        request for request in FakeHTTPClient.requests if request["url"].endswith("/config")
+    )
+    assert config_request["headers"] == {"Authorization": "Bearer gainst_installer_secret"}
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["api_key"] == "legacy-management-key"
+    assert persisted["runtime_api_key"] == "ga_runtime_secret_once"
+    assert persisted["runtime_key_scopes"] == ["responses:create"]
+    assert persisted["runtime_key_mode"] == "test"
+    assert persisted["release_preview_binding_id"] == "binding-1"
+    assert persisted["release_preview_release_id"] == "release-1"
+    runtime_key_create = next(
+        request
+        for request in FakeHTTPClient.requests
+        if request["method"] == "POST" and request["url"].endswith("/preview")
+    )
+    assert runtime_key_create["json"]["launch_session_id"] == session_id
+    assert runtime_key_create["json"]["expected_release_fingerprint"] == "e" * 64
+    env_content = (workspace / ".env.local").read_text(encoding="utf-8")
+    assert "GENAUG_API_KEY=ga_runtime_secret_once" in env_content
+    assert (workspace / ".env.local").stat().st_mode & 0o777 == 0o600
+    receipt = workspace / ".genaug" / "provisioning-receipt.json"
+    assert receipt.exists()
+    assert "ga_runtime_secret_once" not in receipt.read_text(encoding="utf-8")
+    receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert receipt_payload["runtime_key"] == {
+        "action": "created",
+        "active_matching_count": 1,
+        "authority": "candidate_test_preview",
+        "expires_at": "2099-07-13T13:00:00Z",
+        "id": "key-1",
+        "masked_key": "ga...cret",
+        "preview_binding_id": "binding-1",
+        "scopes": ["responses:create"],
+    }
+    assert receipt_payload["authorities"]["runtime_execution"] == "candidate_test_preview"
+
+    FakeHTTPClient.requests = []
+    FakeHTTPClient.queue = [
+        json_response({"items": [{"id": "project-1", "slug": "habit-app", "name": "Habit"}]}),
+        json_response(approved),
+        json_response({"id": "project-1", "slug": "habit-app", "name": "Habit"}),
+        json_response(release_row),
+        json_response({"items": [runtime_key_row]}),
+    ]
+
+    second = runner.invoke(app, args)
+
+    assert second.exit_code == 0, second.output
+    assert json.loads(second.output)["runtime_key"]["action"] == "reused"
+    assert not any(
+        request["method"] == "POST" and request["url"].endswith("/preview")
+        for request in FakeHTTPClient.requests
+    )
+
+    rotated_key_row = {
+        **runtime_key_row,
+        "id": "key-2",
+        "masked_key": "ga...ated",
+        "preview_binding_id": "binding-2",
+    }
+    FakeHTTPClient.requests = []
+    FakeHTTPClient.queue = [
+        json_response({"items": [{"id": "project-1", "slug": "habit-app", "name": "Habit"}]}),
+        json_response(approved),
+        json_response({"id": "project-1", "slug": "habit-app", "name": "Habit"}),
+        json_response(release_row),
+        json_response({"items": [runtime_key_row]}),
+        json_response({"status": "revoked", "id": "binding-1"}),
+        json_response(
+            {
+                "binding_id": "binding-2",
+                "release_id": "release-1",
+                "runtime_key_id": "key-2",
+                "runtime_api_key": "ga_runtime_rotated_once",
+                "expires_at": "2026-07-13T14:00:00Z",
+            }
+        ),
+        json_response({"items": [rotated_key_row]}),
+    ]
+
+    rotated = runner.invoke(app, [*args, "--rotate-runtime-key"])
+
+    assert rotated.exit_code == 0, rotated.output
+    assert "ga_runtime_rotated_once" not in rotated.output
+    assert json.loads(rotated.output)["runtime_key"]["action"] == "rotated"
+    post_index = next(
+        index
+        for index, request in enumerate(FakeHTTPClient.requests)
+        if request["method"] == "POST" and request["url"].endswith("/preview")
+    )
+    delete_index = next(
+        index
+        for index, request in enumerate(FakeHTTPClient.requests)
+        if request["method"] == "DELETE" and request["url"].endswith("/binding-1")
+    )
+    assert delete_index < post_index
+    assert "GENAUG_API_KEY=ga_runtime_rotated_once" in (workspace / ".env.local").read_text(
+        encoding="utf-8"
+    )
+    persisted_after_rotation = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted_after_rotation["runtime_key_id"] == "key-2"
+
+    FakeHTTPClient.requests = []
+    FakeHTTPClient.queue = [
+        json_response({"items": [{"id": "project-1", "slug": "habit-app", "name": "Habit"}]}),
+        json_response(approved),
+        json_response({"id": "project-1", "slug": "habit-app", "name": "Habit"}),
+        json_response(release_row),
+        json_response({"items": [rotated_key_row]}),
+        json_response({"detail": "temporary revoke failure"}, status_code=503),
+    ]
+
+    failed_rotation = runner.invoke(app, [*args, "--rotate-runtime-key"])
+
+    assert failed_rotation.exit_code == 1
+    assert not any(
+        request["method"] == "POST" and request["url"].endswith("/preview")
+        for request in FakeHTTPClient.requests
+    )
+    restored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert restored["runtime_key_id"] == "key-2"
+    restored_env = (workspace / ".env.local").read_text(encoding="utf-8")
+    assert "GENAUG_API_KEY=ga_runtime_rotated_once" in restored_env
+
+
+def test_launch_finalize_requires_ready_evidence_and_installs_durable_key(
+    tmp_path: Path,
+) -> None:
+    """Finalization promotes exact evidence and replaces preview authority without leaking it."""
+    workspace = tmp_path / "habit-app"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "15.5.18"}}),
+        encoding="utf-8",
+    )
+    (workspace / ".gitignore").write_text(".env.local\n.genaug/\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    manifest_path = workspace / "genaug-agent.yaml"
+    manifest = build_launch_manifest(workspace, inspect_workspace(workspace))
+    write_launch_manifest(manifest_path, manifest, workspace=workspace)
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    artifact = _launch_artifact(
+        workspace,
+        manifest_path,
+        inspect_workspace(workspace),
+        manifest,
+    )
+    now = datetime.now(UTC).isoformat()
+    genaug = workspace / ".genaug"
+    genaug.mkdir()
+    checks = [
+        {
+            "name": name,
+            "required": True,
+            "status": "PASS",
+            "reason_code": f"{name}_verified",
+            "detail": "Verified by the isolated certification run.",
+            "evidence": [{"artifact_sha256": "a" * 64}],
+            "checked_at": now,
+        }
+        for name in REQUIRED_BETA_CHECKS
+    ]
+    (genaug / "launch-verification.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "general-augment-launch-verification/v1",
+                "verdict": "READY",
+                "verified_at": now,
+                "manifest_fingerprint": manifest_fingerprint(manifest),
+                "session_id": artifact["session_id"],
+                "checks": checks,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_content = manifest_path.read_text(encoding="utf-8")
+    (genaug / "provisioning-receipt.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "general-augment-provisioning-receipt/v1",
+                "session_id": artifact["session_id"],
+                "project_id": "project-1",
+                "approved_plan_fingerprint": launch_session_fingerprint(artifact),
+                "manifest_sha256": hashlib.sha256(manifest_content.encode("utf-8")).hexdigest(),
+                "release": {
+                    "id": "release-1",
+                    "fingerprint": "e" * 64,
+                    "status": "candidate",
+                },
+                "environment": {
+                    "status": "action_required",
+                    "target": str(workspace / ".env.local"),
+                },
+                "checked_at": now,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "active_project": "project-1",
+                "runtime_api_key": "ga_preview_secret",
+                "runtime_key_id": "preview-key",
+                "runtime_key_project_id": "project-1",
+                "runtime_key_scopes": ["responses:create"],
+                "runtime_key_mode": "test",
+                "release_preview_binding_id": "binding-1",
+                "release_preview_release_id": "release-1",
+                "release_preview_fingerprint": "e" * 64,
+                "metadata": {"installer": {"access_token": "installer-secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    durable = {
+        "id": "durable-key",
+        "name": "One-prompt launch app backend",
+        "masked_key": "ga_test_...",
+        "project_id": "project-1",
+        "scopes": ["responses:create"],
+        "runtime_mode": "test",
+        "preview_binding_id": None,
+    }
+    release = {"id": "release-1", "fingerprint": "e" * 64, "status": "candidate"}
+    FakeHTTPClient.queue = [
+        json_response([release]),
+        json_response({**release, "status": "verified"}),
+        json_response({"active_release_id": "release-1", "runtime_mode": "test"}),
+        json_response({"items": []}),
+        json_response({**durable, "api_key": "ga_durable_secret"}),
+        json_response({"items": [durable]}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--finalize",
+            "--configure-application-env",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "ga_preview_secret" not in result.output
+    assert "ga_durable_secret" not in result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "FINALIZED"
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["runtime_key_id"] == "durable-key"
+    assert persisted["release_preview_binding_id"] is None
+    env = (workspace / ".env.local").read_text(encoding="utf-8")
+    assert "GENAUG_API_KEY=ga_durable_secret" in env
+    receipt = (workspace / ".genaug" / "launch-finalization.json").read_text(encoding="utf-8")
+    assert "ga_durable_secret" not in receipt
+
+
+def test_launch_review_reuses_project_with_generated_name_and_slug(tmp_path: Path) -> None:
+    """Review reruns must reuse the project created before a later phase fails."""
+    existing = {"id": "project-1", "slug": "habit-app", "name": "Habit Assistant"}
+
+    selected = _select_or_create_project(
+        cast(PlatformClient, object()),
+        token="unused",
+        workspace=tmp_path,
+        projects_payload={"items": [existing]},
+        project=None,
+        project_name="Habit Assistant",
+        project_slug="habit-app",
+    )
+
+    assert selected is existing
+
+
+def test_launch_review_binds_without_regenerating_reviewed_multi_agent_plan(
+    tmp_path: Path,
+) -> None:
+    """Hosted review must receive the exact declared topology and release intent."""
+    workspace = tmp_path / "habit-app"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "15.5.18"}}),
+        encoding="utf-8",
+    )
+    manifest = build_launch_manifest(workspace, {"detected": {"frameworks": ["nextjs"]}})
+    manifest["tools"] = {"builtin": ["web_search"], "mcp": []}
+    manifest["agents"][0]["tools"] = ["web_search"]
+    manifest["agents"][0]["skills"] = ["habit-coaching@1.0.0"]
+    manifest["agents"].append(
+        {
+            "name": "triage",
+            "display_name": "Triage",
+            "entry": False,
+            "personality": {"role": "Triage habit questions"},
+            "model": dict(manifest["agents"][0]["model"]),
+            "tools": [],
+            "skills": [],
+            "memory": {"user_profile": "read"},
+            "delegations": [],
+        }
+    )
+    manifest["agents"][0]["delegations"] = [{"to": "triage", "mode": "as_tool"}]
+    manifest["x-general-augment-launch"]["project"] = {
+        "create": True,
+        "name": "Habit App",
+        "slug": "habit-app",
+        "workspace": {"ref": "workspace-1"},
+    }
+    manifest["x-general-augment-launch"]["release"] = {
+        "intent": "live",
+        "activation_allowed": False,
+        "requires_verified_release": True,
+    }
+    write_launch_manifest(
+        workspace / "genaug-agent.yaml",
+        manifest,
+        workspace=workspace,
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "items": [
+                    {
+                        "id": "workspace-1",
+                        "name": "Personal workspace",
+                        "slug": "personal",
+                        "kind": "personal",
+                        "role": "owner",
+                    }
+                ]
+            }
+        ),
+        json_response({"items": []}),
+        json_response(
+            {
+                "id": "project-1",
+                "workspace_id": "workspace-1",
+                "name": "Habit App",
+                "slug": "habit-app",
+            }
+        ),
+        json_response({"session_id": "launch_reviewed_exactly"}),
+        json_response(
+            {
+                "session_id": "launch_reviewed_exactly",
+                "status": "review_required",
+                "approval_source": "none",
+                "approval_reason": "launch_review_required",
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--review",
+            "--account-workspace",
+            "workspace-1",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    persisted = yaml.safe_load(
+        (workspace / "genaug-agent.yaml").read_text(encoding="utf-8")
+    )
+    assert [agent["name"] for agent in persisted["agents"]] == [
+        manifest["agents"][0]["name"],
+        "triage",
+    ]
+    assert persisted["agents"][0]["tools"] == ["web_search"]
+    assert persisted["agents"][0]["skills"] == ["habit-coaching@1.0.0"]
+    assert persisted["agents"][0]["delegations"] == [
+        {"to": "triage", "mode": "as_tool"}
+    ]
+    assert persisted["x-general-augment-launch"]["release"]["intent"] == "live"
+    assert persisted["x-general-augment-launch"]["project"] == {
+        "ref": "project-1",
+        "link_state": "linked",
+        "workspace": {"ref": "workspace-1"},
+    }
+    launch_request = next(
+        request
+        for request in FakeHTTPClient.requests
+        if request["method"] == "POST" and request["url"].endswith("/launch-sessions")
+    )
+    assert launch_request["url"].endswith("/projects/project-1/launch-sessions")
+    assert launch_request["json"]["manifest_schema_version"] == "genaug/v2"
+    assert launch_request["json"]["approval_mode"] == "required"
+    uploaded = yaml.safe_load(launch_request["json"]["configuration"]["yaml_content"])
+    assert uploaded["agents"] == persisted["agents"]
+    assert launch_request["json"]["plan"]["release"]["intent"] == "live"
+
+
+def test_launch_review_can_request_bounded_server_policy_without_granting_it_locally(
+    tmp_path: Path,
+) -> None:
+    """The CLI may request safe auto-approval, but only reports the server's decision."""
+    workspace = tmp_path / "safe-app"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "15.5.18"}}),
+        encoding="utf-8",
+    )
+    manifest = build_launch_manifest(workspace, {"detected": {"frameworks": ["nextjs"]}})
+    write_launch_manifest(workspace / "genaug-agent.yaml", manifest, workspace=workspace)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "items": [
+                    {
+                        "id": "workspace-1",
+                        "name": "Personal workspace",
+                        "slug": "personal",
+                        "kind": "personal",
+                        "role": "owner",
+                    }
+                ]
+            }
+        ),
+        json_response(
+            {
+                "items": [
+                    {
+                        "id": "project-1",
+                        "workspace_id": "workspace-1",
+                        "name": "Safe App",
+                        "slug": "safe-app",
+                    }
+                ]
+            }
+        ),
+        json_response({"session_id": "launch_safe_policy"}),
+        json_response(
+            {
+                "session_id": "launch_safe_policy",
+                "status": "approved",
+                "approval_source": "policy",
+                "approval_reason": "standing_policy_safe_change",
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--review",
+            "--project",
+            "project-1",
+            "--account-workspace",
+            "workspace-1",
+            "--auto-approve-safe",
+            "--no-browser",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "APPROVED"
+    assert payload["approval_source"] == "policy"
+    launch_request = next(
+        request
+        for request in FakeHTTPClient.requests
+        if request["method"] == "POST" and request["url"].endswith("/launch-sessions")
+    )
+    assert launch_request["json"]["approval_mode"] == "safe_auto"
+
+
+def test_agent_cli_is_read_only_and_points_mutations_to_declarative_launch(
+    tmp_path: Path,
+) -> None:
+    """Installer Agent changes must not bypass the reviewed manifest fingerprint."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "active_project": "project-1",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            [
+                {
+                    "id": "agent-1",
+                    "name": "Habit Assistant",
+                    "slug": "habit-assistant",
+                    "is_entry": True,
+                    "status": "active",
+                }
+            ]
+        )
+    ]
+
+    status = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "agent", "status", "--json"],
+    )
+    help_result = CliRunner().invoke(app, ["agent", "--help"])
+
+    assert status.exit_code == 0, status.output
+    payload = json.loads(status.output)
+    assert payload == {
+        "project_id": "project-1",
+        "agent_count": 1,
+        "entry_agent_ids": ["agent-1"],
+        "configuration_source": "genaug-agent.yaml",
+        "mutation_mode": "declarative_launch",
+        "approval_enforcement": "server_fingerprint",
+        "next": "genaug launch --activate --auto-approve-safe --json",
+    }
+    assert help_result.exit_code == 0
+    compact_help = compact_cli_output(help_result)
+    assert "list" in compact_help
+    assert "show" in compact_help
+    assert "status" in compact_help
+    assert "create" not in compact_help
+    assert "tools" not in compact_help
+    assert "skills" not in compact_help
+    assert FakeHTTPClient.requests[0]["method"] == "GET"
+    assert FakeHTTPClient.requests[0]["url"].endswith("/projects/project-1/agents")
+
+
+def test_launch_activate_falls_back_to_review_without_applying_configuration(
+    tmp_path: Path,
+) -> None:
+    """A coding agent cannot turn an unapproved launch request into authority."""
+    workspace = tmp_path / "review-required-app"
+    workspace.mkdir()
+    (workspace / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "15.5.18"}}),
+        encoding="utf-8",
+    )
+    manifest = build_launch_manifest(workspace, {"detected": {"frameworks": ["nextjs"]}})
+    write_launch_manifest(workspace / "genaug-agent.yaml", manifest, workspace=workspace)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "items": [
+                    {
+                        "id": "workspace-1",
+                        "name": "Personal workspace",
+                        "slug": "personal",
+                        "kind": "personal",
+                        "role": "owner",
+                    }
+                ]
+            }
+        ),
+        json_response(
+            {
+                "items": [
+                    {
+                        "id": "project-1",
+                        "workspace_id": "workspace-1",
+                        "name": "Review Required App",
+                        "slug": "review-required-app",
+                    }
+                ]
+            }
+        ),
+        json_response({"session_id": "launch_review_required"}),
+        json_response(
+            {
+                "session_id": "launch_review_required",
+                "status": "review_required",
+                "approval_source": "none",
+                "approval_reason": "first_launch_requires_review",
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--activate",
+            "--project",
+            "project-1",
+            "--account-workspace",
+            "workspace-1",
+            "--no-browser",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "REVIEW_REQUIRED"
+    assert payload["approval_source"] == "none"
+    assert payload["approval_reason"] == "first_launch_requires_review"
+    assert payload["dashboard_review_url"].endswith(
+        "/dashboard/projects/project-1/launch/launch_review_required"
+    )
+    assert all(not request["url"].endswith("/config") for request in FakeHTTPClient.requests)
+    assert all("/runtime-keys" not in request["url"] for request in FakeHTTPClient.requests)
+    launch_request = FakeHTTPClient.requests[2]
+    assert launch_request["json"]["approval_mode"] == "safe_auto"
+
+
+def test_launch_release_intent_controls_runtime_key_mode() -> None:
+    """Test and Live keys remain distinct and follow the exact reviewed release intent."""
+    artifact = {"plan": {"release": {"intent": "live"}}}
+    keys = [
+        {
+            "name": "One-prompt launch app backend",
+            "runtime_mode": "test",
+            "scopes": ["responses:create"],
+        },
+        {
+            "name": "One-prompt launch app backend",
+            "runtime_mode": "live",
+            "scopes": ["responses:create"],
+        },
+    ]
+
+    assert _release_intent(artifact) == "live"
+    assert _matching_launch_runtime_keys(keys, runtime_mode="live") == [keys[1]]
+
+
+def test_server_release_check_uses_non_sensitive_evidence_ids() -> None:
+    """Release verification forwards identifiers and digests, not captured evidence bodies."""
+    row = {
+        "name": "streaming_event_sequence",
+        "status": "PASS",
+        "reason_code": "stream_complete",
+        "detail": "Observed the required sequence.",
+        "checked_at": "2026-07-14T00:00:00Z",
+        "evidence": [{"response_id": "resp_123", "event_types": ["created", "completed"]}],
+    }
+
+    projected = _server_release_check(row)
+
+    assert projected["evidence_ids"] == ["resp_123"]
+    assert "event_types" not in projected
+
+
+def test_platform_client_uses_explicit_credentials_for_each_role() -> None:
+    """Admin, installer, and runtime requests must not share credential material."""
+    config = CLIConfig(
+        base_url="http://api.test",
+        api_key="management-secret",
+        runtime_api_key="runtime-secret",
+    )
+    FakeHTTPClient.queue = [
+        json_response({"id": "project-1"}),
+        json_response({"status": "completed"}),
+        json_response({"type": "response.completed", "response": {"id": "resp-1"}}),
+    ]
+
+    with PlatformClient(config) as client:
+        client.admin("GET", "/projects/project-1")
+        client.runtime_app("POST", "/v1/responses", json={"input": "hello"})
+        list(client.runtime_response_event_stream(json={"input": "hello"}))
+
+    assert FakeHTTPClient.requests[0]["headers"] == {"X-Admin-Key": "management-secret"}
+    assert FakeHTTPClient.requests[1]["headers"] == {"Authorization": "Bearer runtime-secret"}
+    assert FakeHTTPClient.requests[2]["headers"] == {
+        "Authorization": "Bearer runtime-secret",
+        "Accept": "text/event-stream",
+    }
+    assert FakeHTTPClient.requests[2]["json"]["stream"] is True
+
+
+def test_installer_access_token_refreshes_expired_profile_without_leaking_tokens(
+    tmp_path: Path,
+) -> None:
+    """Expired access auth should rotate both tokens and persist the replacement safely."""
+    config_path = tmp_path / "config.yaml"
+    config = CLIConfig(
+        base_url="http://api.test",
+        metadata={
+            "installer": {
+                "access_token": "expired-access-secret",
+                "refresh_token": "old-refresh-secret",
+                "expires_at": "2026-01-01T00:00:00Z",
+                "scopes": ["projects:read"],
+            }
+        },
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "access_token": "replacement-access-secret",
+                "refresh_token": "replacement-refresh-secret",
+                "expires_at": "2027-01-01T00:00:00Z",
+                "scopes": ["projects:read"],
+                "project_id": None,
+            }
+        )
+    ]
+    runtime = Runtime(config=config, config_path=config_path, loaded_config_path=config_path)
+
+    token = installer_access_token(runtime)
+
+    assert token == "replacement-access-secret"
+    assert FakeHTTPClient.requests[0]["json"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "old-refresh-secret",
+    }
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["metadata"]["installer"]["access_token"] == token
+    assert persisted["metadata"]["installer"]["refresh_token"] == ("replacement-refresh-secret")
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_auth_whoami_refreshes_expired_installer_access_token(tmp_path: Path) -> None:
+    """Whoami should use the same refresh-aware installer authority as other commands."""
+    config_path = tmp_path / "config.yaml"
+    config = CLIConfig(
+        base_url="http://api.test",
+        api_key="runtime-key-must-not-be-used-for-whoami",
+        metadata={
+            "installer": {
+                "access_token": "expired-access-secret",
+                "refresh_token": "refresh-secret",
+                "expires_at": "2026-01-01T00:00:00Z",
+                "scopes": ["projects:read"],
+            }
+        },
+    )
+    config_path.write_text(config.model_dump_json(), encoding="utf-8")
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "access_token": "replacement-access-secret",
+                "refresh_token": "replacement-refresh-secret",
+                "expires_at": "2027-01-01T00:00:00Z",
+                "scopes": ["projects:read"],
+            }
+        ),
+        json_response({"auth_method": "installer", "project_ids": ["project-1"]}),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "auth", "whoami", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["project_ids"] == ["project-1"]
+    assert FakeHTTPClient.requests[0]["json"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "refresh-secret",
+    }
+    assert FakeHTTPClient.requests[1]["headers"]["Authorization"] == (
+        "Bearer replacement-access-secret"
+    )
+
+
+def test_dashboard_urls_honor_environment_and_use_real_observability_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All generated dashboard links should stay in the selected deployment."""
+    monkeypatch.setenv("GENAUG_DASHBOARD_URL", "https://preview.example.test/")
+
+    assert dashboard_project_url("project/id") == (
+        "https://preview.example.test/dashboard/projects/project%2Fid"
+    )
+    assert dashboard_observability_url(
+        project="project/id",
+        filters={"trace_id": "trace/id"},
+    ) == (
+        "https://preview.example.test/dashboard/observability?"
+        "trace_id=trace%2Fid&project_id=project%2Fid"
+    )
+
+
 def test_auth_whoami_json_reports_unauthenticated(tmp_path: Path) -> None:
     """Machine-readable auth checks should work before login."""
     config_path = tmp_path / "config.yaml"
@@ -228,12 +1195,245 @@ def test_auth_whoami_json_reports_unauthenticated(tmp_path: Path) -> None:
     }
 
 
+def test_workspace_and_project_commands_persist_explicit_context(tmp_path: Path) -> None:
+    """Workspace and Project selection should be explicit and remain unambiguous."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "items": [
+                    {
+                        "id": "workspace_1",
+                        "name": "Acme",
+                        "slug": "acme",
+                        "kind": "shared",
+                        "role": "owner",
+                    }
+                ]
+            }
+        ),
+        json_response(
+            {
+                "id": "project_1",
+                "workspace_id": "workspace_1",
+                "name": "Health App",
+                "slug": "health-app",
+            }
+        ),
+        json_response(
+            {
+                "items": [
+                    {
+                        "id": "project_1",
+                        "workspace_id": "workspace_1",
+                        "name": "Health App",
+                        "slug": "health-app",
+                    }
+                ]
+            }
+        ),
+    ]
+
+    select_workspace = runner.invoke(
+        app,
+        ["--config", str(config_path), "workspace", "use", "acme"],
+    )
+    create_project = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "project",
+            "create",
+            "--name",
+            "Health App",
+            "--slug",
+            "health-app",
+        ],
+    )
+    select_project = runner.invoke(
+        app,
+        ["--config", str(config_path), "project", "use", "health-app"],
+    )
+
+    assert select_workspace.exit_code == 0, select_workspace.output
+    assert create_project.exit_code == 0, create_project.output
+    assert select_project.exit_code == 0, select_project.output
+    assert FakeHTTPClient.requests[1]["json"] == {
+        "name": "Health App",
+        "slug": "health-app",
+        "workspace_id": "workspace_1",
+    }
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["active_workspace"] == "workspace_1"
+    assert persisted["active_project"] == "project_1"
+
+
+def test_workspace_create_clears_stale_project_context(tmp_path: Path) -> None:
+    """Changing Workspace must not retain a Project from another Workspace."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "active_workspace": "old_workspace",
+                "active_project": "old_project",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "id": "workspace_2",
+                "name": "New Company",
+                "slug": "new-company",
+                "kind": "shared",
+                "role": "owner",
+            }
+        )
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "workspace",
+            "create",
+            "--name",
+            "New Company",
+            "--slug",
+            "new-company",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["active_workspace"] == "workspace_2"
+    assert persisted["active_project"] is None
+
+
+def test_release_commands_use_installer_not_runtime_authority(
+    tmp_path: Path,
+) -> None:
+    """Release control calls must retain installer rather than runtime authority."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "active_workspace": "workspace_1",
+                "active_project": "project_1",
+                "runtime_api_key": "runtime-secret-must-not-be-used",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    FakeHTTPClient.queue = [
+        json_response(
+            {
+                "id": "release_1",
+                "version": 1,
+                "status": "candidate",
+                "fingerprint": "sha256-release-one",
+            }
+        ),
+        json_response(
+            {
+                "id": "deployment_1",
+                "runtime_mode": "test",
+                "active_release_id": "release_1",
+            }
+        ),
+    ]
+
+    release_result = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "release", "create"],
+    )
+    promote_result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "promote",
+            "release_1",
+            "--mode",
+            "test",
+        ],
+    )
+
+    assert release_result.exit_code == 0, release_result.output
+    assert promote_result.exit_code == 0, promote_result.output
+    assert all(
+        request["headers"] == {"Authorization": "Bearer gainst_access_secret"}
+        for request in FakeHTTPClient.requests
+    )
+    assert FakeHTTPClient.requests[1]["json"] == {
+        "runtime_mode": "test",
+        "idempotency_key": "cli-promote-project_1-release_1-test",
+    }
+    assert "runtime-secret-must-not-be-used" not in json.dumps(FakeHTTPClient.requests)
+
+
+def test_release_live_actions_require_explicit_confirmation(tmp_path: Path) -> None:
+    """Live promotion and rollback must fail before making a network request."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://api.test",
+                "active_project": "project_1",
+                "metadata": {"installer": {"access_token": "gainst_access_secret"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    promote = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "promote",
+            "release_1",
+            "--mode",
+            "live",
+        ],
+    )
+    rollback = CliRunner().invoke(
+        app,
+        ["--config", str(config_path), "release", "rollback", "--mode", "live"],
+    )
+
+    assert promote.exit_code != 0
+    assert rollback.exit_code != 0
+    assert FakeHTTPClient.requests == []
+
+
 def test_auth_login_browser_flow_stores_installer_session_without_printing_tokens(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Browser login should exchange an installer code and keep tokens out of output."""
     config_path = tmp_path / "config.yaml"
     runner = CliRunner()
+    monkeypatch.setattr("platform.node", lambda: "Rune's MacBook Pro\n")
     FakeHTTPClient.queue = [
         json_response(
             {
@@ -248,7 +1448,7 @@ def test_auth_login_browser_flow_stores_installer_session_without_printing_token
                 "token_type": "Bearer",
                 "access_token": "gainst_access_secret",
                 "refresh_token": "garefr_refresh_secret",
-                "expires_at": "2026-05-23T20:30:00Z",
+                "expires_at": "2099-05-23T20:30:00Z",
                 "scopes": ["projects:write", "runtime_keys:create"],
                 "project_id": "proj/1",
             }
@@ -290,6 +1490,9 @@ def test_auth_login_browser_flow_stores_installer_session_without_printing_token
         "http://api.test/api/v1/installer/auth/browser/start"
     )
     assert FakeHTTPClient.requests[0]["headers"] == {}
+    assert FakeHTTPClient.requests[0]["json"]["client_name"] == "General Augment CLI"
+    assert FakeHTTPClient.requests[0]["json"]["device_name"] == "Rune's MacBook Pro"
+    assert FakeHTTPClient.requests[0]["json"]["redirect_uri"] == auth_command.MANUAL_REDIRECT_URI
     assert FakeHTTPClient.requests[1]["url"] == "http://api.test/api/v1/installer/auth/token"
     assert FakeHTTPClient.requests[2]["headers"] == {"Authorization": "Bearer gainst_access_secret"}
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -322,7 +1525,7 @@ def test_auth_login_browser_flow_accepts_local_callback_without_paste(
                 "token_type": "Bearer",
                 "access_token": "gainst_access_secret",
                 "refresh_token": "garefr_refresh_secret",
-                "expires_at": "2026-05-23T20:30:00Z",
+                "expires_at": "2099-05-23T20:30:00Z",
                 "scopes": ["projects:write", "runtime_keys:create"],
                 "project_id": "proj/1",
             }
@@ -376,10 +1579,37 @@ def test_local_callback_server_captures_browser_authorization_code() -> None:
             body = response.read().decode("utf-8")
 
         assert response.status == 200
-        assert "General Augment CLI" in body
+        assert "Access approved" in body
+        assert "close this tab" in body
         assert callback.wait(0.5) == "gacode_local"
     finally:
         callback.close()
+
+
+def test_local_callback_server_closes_with_idle_browser_connection() -> None:
+    """Browser preconnect sockets must not prevent the CLI from saving auth state."""
+    callback = auth_command._start_local_callback_server(port=0)
+    parsed = urllib.parse.urlparse(callback.redirect_uri)
+    idle_socket = socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port or 0))
+    try:
+        started = time.monotonic()
+        callback.close()
+        assert time.monotonic() - started < 1
+    finally:
+        idle_socket.close()
+
+
+def test_dashboard_success_return_url_is_strictly_allowlisted() -> None:
+    assert auth_command._safe_dashboard_success_url(
+        "https://app.generalaugment.com/cli/authorize/success"
+    )
+    assert auth_command._safe_dashboard_success_url(
+        "https://general-augment-pr61.vercel.app/cli/authorize/success"
+    )
+    assert not auth_command._safe_dashboard_success_url("https://example.com/cli/authorize/success")
+    assert not auth_command._safe_dashboard_success_url(
+        "https://app.generalaugment.com/cli/authorize/success?next=https://example.com"
+    )
 
 
 def test_setup_bootstrap_persists_runtime_key_into_config_but_not_artifact(
@@ -463,11 +1693,14 @@ def test_setup_bootstrap_persists_runtime_key_into_config_but_not_artifact(
     assert FakeHTTPClient.requests[2]["url"] == (
         "http://api.test/api/v1/installer/projects/proj_1/runtime-keys"
     )
+    assert FakeHTTPClient.requests[2]["json"]["runtime_mode"] == "test"
     persisted_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert persisted_config["active_project"] == "proj_1"
     # The runtime key is persisted into config so a brand-new user gets a working
     # auth login -> setup --bootstrap -> smoke chain with no manual export.
-    assert persisted_config["api_key"] == "ga_runtime_secret_once"
+    assert persisted_config["api_key"] is None
+    assert persisted_config["runtime_api_key"] == "ga_runtime_secret_once"
+    assert persisted_config["runtime_key_mode"] == "test"
     assert config_path.stat().st_mode & 0o777 == 0o600
     # The redacted setup artifact must never contain the raw runtime secret.
     assert "ga_runtime_secret_once" not in artifact_path.read_text(encoding="utf-8")
@@ -530,7 +1763,8 @@ def test_setup_bootstrap_can_print_runtime_env_once_without_artifact_secret(
     # --print-env still works, and the key is also persisted into chmod-600 config
     # so the next command authenticates automatically.
     persisted_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    assert persisted_config["api_key"] == "ga_runtime_secret_once"
+    assert persisted_config["api_key"] is None
+    assert persisted_config["runtime_api_key"] == "ga_runtime_secret_once"
 
 
 def test_setup_bootstrap_can_run_browser_login_inline_without_leaking_runtime_key(
@@ -555,7 +1789,7 @@ def test_setup_bootstrap_can_run_browser_login_inline_without_leaking_runtime_ke
                 "token_type": "Bearer",
                 "access_token": "gainst_access_secret",
                 "refresh_token": "garefr_refresh_secret",
-                "expires_at": "2026-05-23T20:30:00Z",
+                "expires_at": "2099-05-23T20:30:00Z",
                 "scopes": ["projects:write", "runtime_keys:create"],
                 "project_id": None,
             }
@@ -626,7 +1860,8 @@ def test_setup_bootstrap_can_run_browser_login_inline_without_leaking_runtime_ke
     assert persisted_config["active_project"] == "proj_1"
     # The minted runtime key is persisted into chmod-600 config so the next command
     # authenticates without a manual export; the raw key still never hits output.
-    assert persisted_config["api_key"] == "ga_runtime_secret_once"
+    assert persisted_config["api_key"] is None
+    assert persisted_config["runtime_api_key"] == "ga_runtime_secret_once"
 
 
 def test_setup_guided_can_configure_provider_health_from_env_vars(
@@ -1365,8 +2600,25 @@ def test_console_scripts_include_public_command_only() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
 
-    assert scripts["genaug"] == "platform_cli.main:app"
+    assert scripts["genaug"] == "platform_cli.main:run"
     assert "general_augment" not in scripts
+
+
+def test_console_entrypoint_returns_nonzero_for_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The installed console command must not turn a failed operation into success."""
+    main_module = import_module("platform_cli.main")
+
+    def fail() -> None:
+        raise CLIError("synthetic failure")
+
+    monkeypatch.setattr(main_module, "app", fail)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        main_module.run()
+
+    assert exc_info.value.exit_code == 1
 
 
 def test_version_flag_exposes_cli_package_version() -> None:
@@ -1555,10 +2807,11 @@ def test_keys_create_list_update_and_revoke(tmp_path: Path) -> None:
             {
                 "id": "key/1",
                 "name": "Production backend",
-                "api_key": "gaadmlive_secret",
-                "masked_key": "gaadmlive_s...cret",
+                "api_key": "gabtest_secret",
+                "masked_key": "gabtest_se...cret",
                 "project_id": "proj/1",
-                "scopes": ["admin"],
+                "scopes": ["responses:create"],
+                "runtime_mode": "test",
             }
         ),
         json_response(
@@ -1567,9 +2820,10 @@ def test_keys_create_list_update_and_revoke(tmp_path: Path) -> None:
                     {
                         "id": "key/1",
                         "name": "Production backend",
-                        "masked_key": "gaadmlive_s...cret",
+                        "masked_key": "gabtest_se...cret",
                         "project_id": "proj/1",
-                        "scopes": ["admin"],
+                        "scopes": ["responses:create"],
+                        "runtime_mode": "test",
                         "expires_at": None,
                     }
                 ]
@@ -1601,13 +2855,16 @@ def test_keys_create_list_update_and_revoke(tmp_path: Path) -> None:
     revoked = runner.invoke(app, ["--config", str(config_path), "keys", "revoke", "key/1"])
 
     assert created.exit_code == 0
-    assert "gaadmlive_secret" in created.output
+    assert "gabtest_secret" in created.output
     assert listed.exit_code == 0
-    assert "gaadmlive_s...cret" in listed.output
+    assert "Production" in listed.output
+    assert "test" in listed.output
     assert updated.exit_code == 0
     assert revoked.exit_code == 0
     assert FakeHTTPClient.requests[1]["url"].endswith("/api/v1/admin/keys")
     assert FakeHTTPClient.requests[1]["json"]["project_id"] == "proj/1"
+    assert FakeHTTPClient.requests[1]["json"]["scopes"] == ["responses:create"]
+    assert FakeHTTPClient.requests[1]["json"]["runtime_mode"] == "test"
     assert FakeHTTPClient.requests[3]["url"].endswith("/api/v1/admin/keys/key%2F1")
     assert FakeHTTPClient.requests[4]["method"] == "DELETE"
 
@@ -1744,7 +3001,9 @@ def test_validate_agent_config_rejects_empty_manifest(tmp_path: Path) -> None:
     assert result.exit_code != 0
     payload = first_json_object(result.output)
     assert payload["status"] == "FAIL"
-    assert "Agent manifest must use apiVersion genaug/v1 and kind Agent." in payload["errors"]
+    errors = " ".join(payload["errors"])
+    assert "Manifest must use apiVersion genaug/v1" in errors
+    assert "apiVersion genaug/v2" in errors
 
 
 def test_integrate_auto_deploy_registers_openapi_tools(tmp_path: Path) -> None:
@@ -1833,10 +3092,11 @@ def test_keys_create_json_includes_one_time_secret(tmp_path: Path) -> None:
             {
                 "id": "key/1",
                 "name": "Production backend",
-                "api_key": "gaadmlive_secret",
-                "masked_key": "gaadmlive_s...cret",
+                "api_key": "gabtest_secret",
+                "masked_key": "gabtest_se...cret",
                 "project_id": "proj/1",
-                "scopes": ["admin"],
+                "scopes": ["responses:create"],
+                "runtime_mode": "test",
             }
         ),
     ]
@@ -1858,8 +3118,88 @@ def test_keys_create_json_includes_one_time_secret(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["api_key"] == "gaadmlive_secret"
+    assert payload["api_key"] == "gabtest_secret"
     assert payload["id"] == "key/1"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            ["--scope", "responses:create", "--scope", "admin"],
+            "Runtime and management scopes cannot be combined",
+        ),
+        (["--scope", "responses:create"], "Runtime-scoped keys require --project"),
+        (["--scope", "admin", "--runtime-mode", "live"], "runtime-scoped keys"),
+    ],
+)
+def test_keys_create_rejects_ambiguous_credential_roles(
+    tmp_path: Path,
+    arguments: list[str],
+    message: str,
+) -> None:
+    """The CLI must reject keys that blur management and runtime authority."""
+
+    config_path = write_config(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "keys",
+            "create",
+            "--name",
+            "Unsafe key",
+            *arguments,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert message in plain_cli_output(result)
+
+
+def test_keys_create_supports_explicit_project_management_key(tmp_path: Path) -> None:
+    """Operators may explicitly mint a project management key without runtime mode."""
+
+    config_path = write_config(tmp_path)
+    project = {"id": "proj/1", "name": "DayPlan", "slug": "dayplan"}
+    FakeHTTPClient.queue = [
+        json_response({"items": [project]}),
+        json_response(
+            {
+                "id": "key/1",
+                "name": "Project operator",
+                "api_key": "gaadmlive_secret",
+                "masked_key": "gaadmlive_s...cret",
+                "project_id": "proj/1",
+                "scopes": ["admin"],
+                "runtime_mode": None,
+            }
+        ),
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "keys",
+            "create",
+            "--name",
+            "Project operator",
+            "--project",
+            "dayplan",
+            "--scope",
+            "admin",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert FakeHTTPClient.requests[1]["json"] == {
+        "name": "Project operator",
+        "project_id": "proj/1",
+        "scopes": ["admin"],
+    }
 
 
 def test_setup_bootstrap_persisted_key_authenticates_smoke_without_export(
@@ -4187,6 +5527,9 @@ def test_verify_runs_project_acceptance_checks(
         "X-Project-ID": "proj/1",
     }
     assert FakeHTTPClient.requests[17]["json"]["metadata"]["feature"] == ("memory_response_recall")
+    assert FakeHTTPClient.requests[17]["json"]["input"] == (
+        "What is my stored onboarding note code? Reply with only the code."
+    )
     assert "abcdef123456" not in FakeHTTPClient.requests[17]["json"]["input"]
     assert FakeHTTPClient.requests[18]["method"] == "DELETE"
     assert FakeHTTPClient.requests[18]["url"].endswith("/api/v1/agent/memory/mem%2F1")
@@ -4482,8 +5825,6 @@ def test_verify_fails_when_runtime_policy_model_routing_is_incomplete(tmp_path: 
         (500, "Retry shortly"),
     ],
 )
-
-
 def write_config(tmp_path: Path) -> Path:
     """Write a CLI config fixture."""
     config_path = tmp_path / "config.yaml"

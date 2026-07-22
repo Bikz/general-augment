@@ -5,10 +5,13 @@ CLI for creating, validating, deploying, and verifying General Augment projects,
 for wiring up auth, providers, tools, and skills.
 
 ```bash
-pip install general-augment-cli
-genaug --version
-genaug --help
+uvx --from general-augment-cli genaug --version
+uvx --from general-augment-cli genaug launch --inspect --json
 ```
+
+`uvx` is the preferred checkout-free invocation for coding agents. `pipx install
+general-augment-cli` remains supported when a persistent installation is preferred.
+Standard virtual environments may continue to use `pip install general-augment-cli`.
 
 For source-checkout development, use the repo-local command prefix:
 
@@ -33,11 +36,108 @@ commands an app developer needs, and nothing else:
 | `genaug skills` | `design`, `list`, `view`, `apply`, `delete` |
 | `genaug providers` | `setup`, `smoke`, `readiness` |
 | `genaug connectors` | `setup` |
+| `genaug agent` | `list`, `show`, `status`; `delegation list` |
 | `genaug migrate` | `openai-responses` |
 | `genaug dashboard` | `open` |
-| top-level | `integrate`, `init`, `setup`, `doctor`, `status`, `smoke`, `validate`, `verify` |
+| `genaug launch-skill` | `install`, `status`, `remove` |
+| top-level | `launch`, `integrate`, `init`, `setup`, `doctor`, `status`, `smoke`, `validate`, `verify` |
 
 ## Quick start
+
+For the supported Next.js App Router and Clerk beta lane, start with the read-only
+machine-readable inspector:
+
+```bash
+uvx --from general-augment-cli==0.3.1 genaug launch-skill install --agent all --scope project --version 1.2.0 --json
+uvx --from general-augment-cli==0.3.1 genaug launch --inspect --json
+genaug launch --questions --json
+genaug launch --plan --answers-file .genaug/launch-answers.json --json
+genaug launch --review --json
+```
+
+`--questions` is the read-only handoff for humans and coding agents. It reports the
+authenticated account, available Workspaces and Projects, detected application identity,
+and unresolved Agent-topology or release decisions using stable question IDs. The answers
+file is secret-free and can select or create a Workspace and Project, declare multiple
+Agents, assign Project tools, Skills, and memory, and review delegation edges. Skill
+assignments require `skills_directory` to identify the repository-relative Project Skill
+library; provisioning pins those reviewed files by content hash. The CLI and
+dashboard use the same hierarchy: `Account -> Workspace -> Project -> Agent`.
+
+The review command returns the exact dashboard integration-review URL. After approval,
+provision and explicitly authorize the ignored local environment handoff:
+
+```bash
+genaug launch --provision --approve-session <session-id> \
+  --configure-application-env --json
+```
+
+The CLI applies project configuration with installer authority and stores the separate
+`responses:create` runtime key only in its owner-readable config and the verified
+Git-ignored `.env.local`. Output contains variable names, paths, and masked key metadata,
+never values. Re-running reuses the one active key; use `--rotate-runtime-key` for an
+explicit revoke-and-replace operation. Rollback can remove only the managed env block:
+
+```bash
+genaug launch --provision --approve-session <session-id> \
+  --remove-application-env --json
+```
+
+Then apply the official `generalaugment-launch` coding-agent skill and finish with:
+
+```bash
+genaug launch --verify --json
+genaug launch --finalize --configure-application-env --json
+genaug launch --open-dashboard --no-browser --json
+```
+
+Release operators can bind the temporary preview-key provisioning proof to the durable
+runtime key created by finalization:
+
+```bash
+genaug certification create \
+  --workspace . \
+  --verification .genaug/launch-verification.json \
+  --provision-first .genaug/evidence/provision-first.json \
+  --provision-second .genaug/evidence/provision-second.json \
+  --finalization-first .genaug/evidence/finalization-first.json \
+  --finalization-second .genaug/evidence/finalization-second.json \
+  --browser .genaug/application-verification.json \
+  --deployment .genaug/hosted-deployment.json \
+  --json
+```
+
+Both finalization receipts are required together. The first records creation or reuse of
+one durable Test key; the second must reuse that exact key. Certification fails when the
+launch, Project, immutable release, runtime mode, owner-only environment handoff, or
+deployment identifiers differ. Receipts contain IDs and hashes only, never raw keys.
+
+After a human-approved baseline, a coding agent may ask the server to apply a bounded safe Test
+change with `genaug launch --activate --auto-approve-safe --json`. The flag never grants
+authority: server-owned Project policy either approves the exact fingerprint or returns the
+dashboard review URL. Inspect current state with `genaug agent list|show|status`; Agent mutations
+are made in `genaug-agent.yaml` and applied through `genaug launch` so imperative installer
+commands cannot bypass review.
+
+Set `GENAUG_DASHBOARD_URL` when an isolated control plane uses a non-production
+dashboard. Launch review and verification links will target that dashboard instead of
+`https://app.generalaugment.com`.
+
+The skill installer copies the versioned official skill into the current project's
+Codex and Claude Code skill directories. It verifies every file against the SHA-256
+manifest bundled in the CLI wheel, upgrades managed installations atomically, and
+refuses to overwrite or remove an unmanaged directory. Use `genaug launch-skill status`
+for a read-only integrity check and `genaug launch-skill remove` for rollback.
+
+Planning writes the reviewable `genaug-agent.yaml` `genaug/v2` Project contract. Existing
+`genaug/v1` single-Agent contracts remain readable during the compatibility window. Inspection never writes or
+uploads application source. The beta contract enforces per-user memory, one disabled
+read-only capability, app-owned writes, no arbitrary code execution, and no automatic
+skill learning. Re-running inspection, planning, review, and provisioning is idempotent.
+Launch verification is contractual: every one of the 18 beta-required checks must be
+`PASS`. A required `FAIL`, `SKIP`, missing/stale receipt, plan-fingerprint mismatch, or
+unexecuted application command returns `BLOCKED`; optional warnings alone return
+`READY_WITH_WARNINGS`.
 
 For an existing app, the friendliest first command is the guided wizard. It inspects
 the current app, detects frameworks, env files, OpenAI Responses call sites, prompts,
@@ -84,8 +184,9 @@ genaug auth logout
 
 `genaug auth login` starts browser installer auth by default: it opens the dashboard
 `/cli/authorize` approval page, creates an installer session for setup tasks, and keeps
-that session separate from runtime `/v1/responses` keys. After approval the dashboard
-redirects to the CLI's loopback callback and the CLI exchanges the short-lived code
+that session separate from runtime `/v1/responses` keys. The approval page identifies
+the requesting computer when the operating system provides a device name. After approval,
+the dashboard redirects to the CLI's loopback callback and the CLI exchanges the short-lived code
 automatically; if the callback cannot start or times out, it falls back to a paste-code
 prompt. `genaug auth login --api-key ...` remains available for operator/admin
 workflows and verifies the key against `/api/v1/admin/me` before writing local config.
@@ -99,8 +200,10 @@ export GENAUG_ADMIN_API_KEY=gaadmlive...
 export GENAUG_ADMIN_BASE_URL=https://api.generalaugment.com
 ```
 
-`GENAUG_API_KEY` and `GENAUG_API_BASE_URL` are also accepted, which keeps local mock
-and SDK test scripts easy to share.
+`GENAUG_ADMIN_API_KEY` is management-only. `GENAUG_API_KEY` is application-runtime-only
+and never authorizes CLI control-plane operations. `GENAUG_API_BASE_URL` selects the API
+for both roles. Existing `api_key` config entries remain legacy management credentials;
+they are not silently upgraded or copied into the explicit `runtime_api_key` field.
 
 ## Migrating an existing app
 
@@ -141,10 +244,15 @@ genaug init --interactive
 ## API keys
 
 ```bash
+# Project keys default to test-runtime authority for application backends.
 genaug keys create --project petstore-agent --name "Production backend"
-genaug keys list --project petstore-agent --json
-genaug keys update <key-id> --project petstore-agent --name "Renamed"
-genaug keys revoke <key-id> --project petstore-agent
+# Explicitly request live-runtime authority for a production backend.
+genaug keys create --project petstore-agent --name "Production backend" --runtime-mode live
+# Management keys must be requested explicitly and are never used by the app runtime.
+genaug keys create --project petstore-agent --name "Project operator" --scope admin
+genaug keys list
+genaug keys update <key-id> --name "Renamed"
+genaug keys revoke <key-id>
 ```
 
 ## Providers and connectors

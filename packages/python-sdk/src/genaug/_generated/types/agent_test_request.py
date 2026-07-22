@@ -11,6 +11,7 @@ class AgentTestRequest(UniversalBaseModel):
     Payload for testing an agent without a live channel.
     """
 
+    agent_id: typing.Optional[str] = None
     channel: typing.Optional[str] = None
     message: str
     phone_e164: typing.Optional[str] = None

@@ -8,7 +8,6 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
-from urllib.parse import urlencode
 
 import typer
 
@@ -17,7 +16,7 @@ from platform_cli.errors import CLIError
 from platform_cli.output import panel, print_json, print_success, table
 from platform_cli.redaction import redact_metadata
 from platform_cli.runtime import Runtime
-from platform_cli.self_serve import DEFAULT_DASHBOARD_URL, dashboard_project_url
+from platform_cli.self_serve import dashboard_observability_url, dashboard_project_url
 
 DEFAULT_SMOKE_MESSAGE = "Reply exactly with: genaug-smoke-ok"
 DEFAULT_STRUCTURED_MESSAGE = 'Return JSON with ok=true and label="genaug-smoke-ok".'
@@ -684,12 +683,7 @@ def _dashboard_evidence_urls(
         params["response_id"] = str(response_id)
     if user_id:
         params["user_id"] = user_id
-    query = urlencode(params)
-    observability_url = (
-        f"{DEFAULT_DASHBOARD_URL}/dashboard/observability?{query}"
-        if query
-        else f"{DEFAULT_DASHBOARD_URL}/dashboard/observability"
-    )
+    observability_url = dashboard_observability_url(project=project_ref, filters=params)
     return {
         "project_url": dashboard_project_url(project_ref) if project_ref else None,
         "observability_url": observability_url,

@@ -33,6 +33,9 @@ class ResponsesClient:
         self,
         *,
         model: str,
+        agent_id: typing.Optional[str] = None,
+        deployment_id: typing.Optional[str] = None,
+        agent: typing.Optional[str] = OMIT,
         background: typing.Optional[bool] = OMIT,
         conversation: typing.Optional[str] = OMIT,
         include: typing.Optional[typing.Sequence[str]] = OMIT,
@@ -62,6 +65,12 @@ class ResponsesClient:
         Parameters
         ----------
         model : str
+
+        agent_id : typing.Optional[str]
+
+        deployment_id : typing.Optional[str]
+
+        agent : typing.Optional[str]
 
         background : typing.Optional[bool]
 
@@ -127,6 +136,9 @@ class ResponsesClient:
         """
         _response = self._raw_client.create_response(
             model=model,
+            agent_id=agent_id,
+            deployment_id=deployment_id,
+            agent=agent,
             background=background,
             conversation=conversation,
             include=include,
@@ -172,6 +184,9 @@ class AsyncResponsesClient:
         self,
         *,
         model: str,
+        agent_id: typing.Optional[str] = None,
+        deployment_id: typing.Optional[str] = None,
+        agent: typing.Optional[str] = OMIT,
         background: typing.Optional[bool] = OMIT,
         conversation: typing.Optional[str] = OMIT,
         include: typing.Optional[typing.Sequence[str]] = OMIT,
@@ -201,6 +216,12 @@ class AsyncResponsesClient:
         Parameters
         ----------
         model : str
+
+        agent_id : typing.Optional[str]
+
+        deployment_id : typing.Optional[str]
+
+        agent : typing.Optional[str]
 
         background : typing.Optional[bool]
 
@@ -274,6 +295,9 @@ class AsyncResponsesClient:
         """
         _response = await self._raw_client.create_response(
             model=model,
+            agent_id=agent_id,
+            deployment_id=deployment_id,
+            agent=agent,
             background=background,
             conversation=conversation,
             include=include,

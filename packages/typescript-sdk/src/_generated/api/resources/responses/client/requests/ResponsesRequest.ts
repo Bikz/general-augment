@@ -9,6 +9,9 @@ import type * as GeneralAugment from "../../../../index.js";
  *     }
  */
 export interface ResponsesRequest {
+    "X-Agent-ID"?: string | null;
+    "X-Deployment-ID"?: string | null;
+    agent?: string | null;
     background?: boolean;
     conversation?: string | null;
     include?: string[] | null;

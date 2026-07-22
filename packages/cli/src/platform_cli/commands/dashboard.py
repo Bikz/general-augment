@@ -8,7 +8,7 @@ from typing import Annotated
 import typer
 
 from platform_cli.output import print_json, print_success
-from platform_cli.self_serve import DEFAULT_DASHBOARD_URL, dashboard_project_url
+from platform_cli.self_serve import dashboard_project_url
 
 app = typer.Typer(help="Open General Augment dashboard views.")
 
@@ -26,7 +26,7 @@ def open_dashboard(
     ] = False,
 ) -> None:
     """Open the project dashboard for review."""
-    url = dashboard_project_url(project, base_url=DEFAULT_DASHBOARD_URL)
+    url = dashboard_project_url(project)
     payload = {"url": url, "opened": not no_browser}
     if not no_browser:
         webbrowser.open(url)

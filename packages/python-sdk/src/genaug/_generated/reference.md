@@ -613,6 +613,30 @@ client.responses.create_response(
 <dl>
 <dd>
 
+**agent_id:** `typing.Optional[str]` 
+    
+</dd>
+</dl>
+
+<dl>
+<dd>
+
+**deployment_id:** `typing.Optional[str]` 
+    
+</dd>
+</dl>
+
+<dl>
+<dd>
+
+**agent:** `typing.Optional[str]` 
+    
+</dd>
+</dl>
+
+<dl>
+<dd>
+
 **background:** `typing.Optional[bool]` 
     
 </dd>

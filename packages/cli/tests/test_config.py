@@ -21,7 +21,16 @@ from platform_cli.config import (
 def test_config_file_crud(tmp_path: Path) -> None:
     """Config should save, load, and clear from a custom path."""
     config_path = tmp_path / "config.yaml"
-    config = CLIConfig(base_url="https://api.example.test", api_key="secret", active_project="p1")
+    config = CLIConfig(
+        base_url="https://api.example.test",
+        api_key="management-secret",
+        runtime_api_key="runtime-secret",
+        runtime_key_id="key-1",
+        runtime_key_project_id="p1",
+        runtime_key_scopes=["responses:create"],
+        runtime_key_mode="test",
+        active_project="p1",
+    )
 
     saved = save_config(config, config_path)
     loaded = load_config(saved)
@@ -30,7 +39,9 @@ def test_config_file_crud(tmp_path: Path) -> None:
 
     assert saved == config_path
     assert loaded.base_url == "https://api.example.test"
-    assert loaded.api_key == "secret"
+    assert loaded.api_key == "management-secret"
+    assert loaded.runtime_api_key == "runtime-secret"
+    assert loaded.runtime_key_mode == "test"
     assert loaded.active_project == "p1"
     assert mode == 0o600
     assert not saved.exists()
@@ -83,8 +94,21 @@ def test_runtime_env_overrides_use_genaug(
 
     monkeypatch.setenv("GENAUG_API_BASE_URL", "https://public.test")
     monkeypatch.setenv("GENAUG_ADMIN_API_KEY", "public")
+    monkeypatch.setenv("GENAUG_API_KEY", "runtime")
 
     preferred = apply_runtime_overrides(config)
 
     assert preferred.base_url == "https://public.test"
     assert preferred.api_key == "public"
+    assert preferred.runtime_api_key == "runtime"
+
+
+def test_legacy_api_key_is_not_silently_promoted_to_runtime(tmp_path: Path) -> None:
+    """Loading an old config must not broaden or guess the credential's role."""
+    path = tmp_path / "legacy.yaml"
+    path.write_text("api_key: legacy-ambiguous\nactive_project: p1\n", encoding="utf-8")
+
+    loaded = load_config(path)
+
+    assert loaded.api_key == "legacy-ambiguous"
+    assert loaded.runtime_api_key is None

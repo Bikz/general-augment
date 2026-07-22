@@ -6,12 +6,13 @@ import json
 import os
 import re
 import shlex
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode
 from uuid import UUID
 
-from platform_cli.config import DEFAULT_BASE_URL, CLIConfig
+from platform_cli.config import DEFAULT_BASE_URL, CLIConfig, save_config
 from platform_cli.errors import CLIError
 from platform_cli.workspace_inspector import inspect_workspace
 
@@ -869,6 +870,54 @@ def installer_auth_metadata(config: CLIConfig) -> dict[str, Any] | None:
     return installer
 
 
+def installer_access_token(runtime: Any) -> str:
+    """Return a usable installer token, rotating an expired stored session automatically."""
+    installer = installer_auth_metadata(runtime.config)
+    if installer is None:
+        raise CLIError("Run genaug auth login before using installer operations.")
+    access_token = str(installer.get("access_token") or "")
+    expires_at = _installer_expiry(installer.get("expires_at"))
+    if expires_at is None or expires_at > datetime.now(UTC) + timedelta(seconds=30):
+        return access_token
+    refresh_token = str(installer.get("refresh_token") or "")
+    if not refresh_token:
+        raise CLIError("Installer auth expired. Run genaug auth login again.")
+    with runtime.client() as client:
+        refreshed = client.installer(
+            "POST",
+            "/auth/token",
+            json={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        )
+    if not isinstance(refreshed, dict) or not refreshed.get("access_token"):
+        raise CLIError("Installer token refresh returned an invalid response.")
+    metadata = dict(runtime.config.metadata or {})
+    metadata["installer"] = {
+        **installer,
+        "access_token": refreshed.get("access_token"),
+        "refresh_token": refreshed.get("refresh_token"),
+        "expires_at": refreshed.get("expires_at"),
+        "scopes": refreshed.get("scopes", installer.get("scopes", [])),
+        "project_id": refreshed.get("project_id", installer.get("project_id")),
+    }
+    next_config = runtime.config.model_copy(update={"metadata": metadata})
+    save_config(next_config, runtime.config_path)
+    # Runtime is frozen, but its Pydantic config remains mutable. Keep later
+    # saves in this command from restoring the consumed refresh token.
+    runtime.config.metadata = metadata
+    return str(refreshed["access_token"])
+
+
+def _installer_expiry(value: object) -> datetime | None:
+    """Parse persisted ISO-8601 expiry metadata without breaking older profiles."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def resolve_installer_project_id(client: Any, *, token: str, project_ref: str) -> str:
     """Resolve a project id, slug, or name to its UUID via the installer listing.
 
@@ -1164,16 +1213,57 @@ def next_actions(
     return actions
 
 
-def dashboard_project_url(project: str | None, *, base_url: str = DEFAULT_DASHBOARD_URL) -> str:
+def dashboard_base_url(base_url: str | None = None) -> str:
+    """Return the configured dashboard origin without a trailing slash."""
+    return (base_url or os.getenv("GENAUG_DASHBOARD_URL") or DEFAULT_DASHBOARD_URL).rstrip("/")
+
+
+def dashboard_project_url(project: str | None, *, base_url: str | None = None) -> str:
     """Build a dashboard URL for a project or the project picker.
 
     The Next.js dashboard renders a project at /dashboard/projects/<id>, so this
     is the single source of truth every CLI command uses for project links.
     """
-    base = base_url.rstrip("/")
+    base = dashboard_base_url(base_url)
     if not project:
         return f"{base}/dashboard/projects"
-    return f"{base}/dashboard/projects/{project}"
+    return f"{base}/dashboard/projects/{quote(project, safe='')}"
+
+
+def dashboard_project_section_url(
+    project: str,
+    section: str,
+    *,
+    base_url: str | None = None,
+) -> str:
+    """Build a canonical project-scoped dashboard section URL."""
+    root = dashboard_project_url(project, base_url=base_url)
+    return f"{root}/{quote(section.strip('/'), safe='/')}"
+
+
+def dashboard_launch_url(
+    project: str,
+    session: str,
+    *,
+    base_url: str | None = None,
+) -> str:
+    """Build the exact review URL for one launch session."""
+    root = dashboard_project_url(project, base_url=base_url)
+    return f"{root}/launch/{quote(session, safe='')}"
+
+
+def dashboard_observability_url(
+    *,
+    project: str | None = None,
+    filters: dict[str, str] | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Build the global observability route with optional project/evidence filters."""
+    params = {key: value for key, value in (filters or {}).items() if value}
+    if project:
+        params.setdefault("project_id", project)
+    root = f"{dashboard_base_url(base_url)}/dashboard/observability"
+    return f"{root}?{urlencode(params)}" if params else root
 
 
 def _as_list(value: object) -> list[object]:

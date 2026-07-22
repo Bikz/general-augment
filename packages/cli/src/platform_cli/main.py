@@ -10,18 +10,25 @@ import typer
 from platform_cli import __version__
 from platform_cli.branding import get_branding
 from platform_cli.commands import (
+    agents,
     auth,
+    certification,
     connectors,
     dashboard,
     keys,
+    launch_skill,
     migrate,
+    projects,
     providers,
+    releases,
     skills,
     tools,
+    workspaces,
 )
 from platform_cli.commands.doctor import doctor
 from platform_cli.commands.init import init
 from platform_cli.commands.integrate import integrate
+from platform_cli.commands.launch import launch
 from platform_cli.commands.setup import setup
 from platform_cli.commands.smoke import smoke
 from platform_cli.commands.status import status
@@ -39,6 +46,7 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 app.add_typer(auth.app, name="auth")
+app.add_typer(certification.app, name="certification")
 app.add_typer(keys.app, name="keys")
 app.add_typer(tools.app, name="tools")
 app.add_typer(skills.app, name="skills")
@@ -46,7 +54,13 @@ app.add_typer(providers.app, name="providers")
 app.add_typer(connectors.app, name="connectors")
 app.add_typer(migrate.app, name="migrate")
 app.add_typer(dashboard.app, name="dashboard")
+app.add_typer(launch_skill.app, name="launch-skill")
+app.add_typer(workspaces.app, name="workspace")
+app.add_typer(projects.app, name="project")
+app.add_typer(agents.app, name="agent")
+app.add_typer(releases.app, name="release")
 app.command("integrate")(integrate)
+app.command("launch")(launch)
 app.command("init")(init)
 app.command("setup")(setup)
 app.command("doctor")(doctor)

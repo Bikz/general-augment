@@ -6,6 +6,7 @@ import base64
 import hashlib
 import html
 import http.server
+import platform
 import queue
 import secrets
 import socketserver
@@ -22,8 +23,10 @@ from platform_cli.config import clear_config, save_config
 from platform_cli.errors import CLIError
 from platform_cli.output import panel, print_json, print_success, print_warning
 from platform_cli.runtime import Runtime
+from platform_cli.self_serve import installer_access_token
 
 app = typer.Typer(help="Authenticate the CLI.")
+MANUAL_REDIRECT_URI = "http://127.0.0.1:0/manual"
 
 
 @app.command("login")
@@ -111,12 +114,13 @@ def _browser_login(
     verifier = code_verifier or secrets.token_urlsafe(48)
     challenge = _pkce_challenge(verifier)
     callback: _LocalCallbackServer | None = None
-    redirect_uri = "http://127.0.0.1:8765/callback"
+    redirect_uri = MANUAL_REDIRECT_URI
     if use_callback and authorization_code is None:
         try:
             callback = _start_local_callback_server()
             redirect_uri = callback.redirect_uri
         except OSError as exc:
+            redirect_uri = MANUAL_REDIRECT_URI
             print_warning(
                 "Could not start local browser callback; falling back to authorization code "
                 f"paste. ({exc})"
@@ -133,7 +137,8 @@ def _browser_login(
                 "POST",
                 "/auth/browser/start",
                 json={
-                    "client_name": "genaug-cli",
+                    "client_name": "General Augment CLI",
+                    "device_name": _local_device_name(),
                     "redirect_uri": redirect_uri,
                     "code_challenge": challenge,
                     "code_challenge_method": "S256",
@@ -141,7 +146,7 @@ def _browser_login(
                         "projects:read",
                         "projects:write",
                         "runtime_keys:create",
-                        "setup:write",
+                        "launch:write",
                     ],
                 },
             )
@@ -191,6 +196,12 @@ def _browser_login(
     print_success(f"Installer projects: {_project_scope(identity)}")
 
 
+def _local_device_name() -> str | None:
+    """Return a short display label for the computer requesting browser auth."""
+    normalized = " ".join(platform.node().split())
+    return normalized[:80] or None
+
+
 @app.command("logout")
 def logout(ctx: typer.Context) -> None:
     """Remove local authentication."""
@@ -209,9 +220,10 @@ def whoami(
     """Show the current API identity."""
     runtime = _runtime(ctx)
     installer = runtime.config.metadata.get("installer", {})
-    if not runtime.config.api_key and isinstance(installer, dict) and installer.get("access_token"):
+    if isinstance(installer, dict) and installer.get("access_token"):
+        token = installer_access_token(runtime)
         with runtime.client() as client:
-            payload = client.installer("GET", "/me", token=str(installer["access_token"]))
+            payload = client.installer("GET", "/me", token=token)
         if json_output:
             print_json(_identity_payload(runtime, payload, authenticated=True))
             return
@@ -362,17 +374,27 @@ def _start_local_callback_server(
                 codes.put_nowait(code)
             except queue.Full:
                 pass
+            return_to = values.get("return_to", [""])[0]
+            if _safe_dashboard_success_url(return_to):
+                self.send_response(302)
+                self.send_header("Location", return_to)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             _write_callback_response(
                 self,
                 200,
-                "General Augment CLI authentication complete. You can return to the terminal.",
+                "Access approved. You can close this tab and return to the terminal.",
             )
 
         def log_message(self, *_: object) -> None:
             return
 
-    class LoopbackTCPServer(socketserver.TCPServer):
+    class LoopbackTCPServer(socketserver.ThreadingTCPServer):
         allow_reuse_address = True
+        daemon_threads = True
+        block_on_close = False
 
     try:
         server = LoopbackTCPServer((host, port), Handler)
@@ -397,13 +419,68 @@ def _write_callback_response(
     message: str,
 ) -> None:
     """Write a small browser response for the loopback auth callback."""
-    body = (
-        "<!doctype html><meta charset=\"utf-8\">"
-        "<title>General Augment CLI</title>"
-        f"<body><h1>General Augment CLI</h1><p>{html.escape(message)}</p></body>"
-    ).encode()
+    body = f"""<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>General Augment CLI</title>
+<style>
+  :root {{
+    color-scheme: light;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    background: #f5f4f1;
+    color: #171714;
+    padding: 24px;
+  }}
+  main {{
+    width: min(100%, 520px);
+    border: 1px solid #d9d6cf;
+    border-radius: 12px;
+    background: #fff;
+    padding: 40px;
+    box-shadow: 0 22px 50px rgb(0 0 0 / 10%);
+    text-align: center;
+  }}
+  .brand {{ margin: 0 0 28px; font-size: 14px; font-weight: 700; letter-spacing: -0.01em; }}
+  h1 {{ margin: 0; font-size: 28px; line-height: 1.2; }}
+  p {{ margin: 14px 0 0; color: #5f5d57; font-size: 16px; line-height: 1.6; }}
+</style>
+<body>
+  <main>
+    <div class="brand">General Augment</div>
+    <h1>CLI access approved</h1>
+    <p>{html.escape(message)}</p>
+  </main>
+</body>
+</html>""".encode()
     handler.send_response(status)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _safe_dashboard_success_url(value: str) -> bool:
+    """Allow the loopback callback to return only to a General Augment success page."""
+    if not value:
+        return False
+    parsed = urlparse(value)
+    host = parsed.hostname or ""
+    production_or_preview = parsed.scheme == "https" and (
+        host == "app.generalaugment.com" or host.endswith(".vercel.app")
+    )
+    local_development = parsed.scheme == "http" and host in {"127.0.0.1", "localhost"}
+    return (
+        (production_or_preview or local_development)
+        and parsed.path == "/cli/authorize/success"
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )

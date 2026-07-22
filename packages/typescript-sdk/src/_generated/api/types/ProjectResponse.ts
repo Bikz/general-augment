@@ -14,6 +14,8 @@ export interface ProjectResponse {
     id: string;
     langfuse_project_id?: (string | null) | undefined;
     langfuse_public_key?: (string | null) | undefined;
+    /** Human-owned launch authorization policy. Manifests and installer credentials cannot change this value. */
+    launch_approval_policy?: string | undefined;
     local_connectors?: Record<string, unknown>[] | undefined;
     mcp_servers: Record<string, unknown>[];
     model_preferences: Record<string, string>;
@@ -41,4 +43,5 @@ export interface ProjectResponse {
     /** Display-only project webhook secret preview. */
     webhook_secret_preview?: (string | null) | undefined;
     whatsapp_phone_number_id: string | null;
+    workspace_id?: (string | null) | undefined;
 }

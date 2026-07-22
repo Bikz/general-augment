@@ -15,6 +15,7 @@ from platform_cli.errors import APIError, CLIError
 from platform_cli.output import print_json, table
 from platform_cli.runtime import Runtime
 from platform_cli.self_serve import (
+    installer_access_token,
     installer_auth_metadata,
     normalize_capabilities,
     provider_setup_recipes,
@@ -436,9 +437,10 @@ def _configure_provider(
     if base_url:
         credential_payload["base_url"] = base_url
     installer = installer_auth_metadata(runtime.config)
+    token = installer_access_token(runtime) if installer is not None else None
     with runtime.client() as client:
         if installer is not None:
-            token = str(installer["access_token"])
+            assert token is not None
             project_id = resolve_installer_project_id(
                 client, token=token, project_ref=str(project_ref)
             )

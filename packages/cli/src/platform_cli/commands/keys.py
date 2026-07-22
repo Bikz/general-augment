@@ -11,6 +11,7 @@ from platform_cli.output import panel, print_json, print_success, print_warning,
 from platform_cli.runtime import Runtime
 
 app = typer.Typer(help="Manage project-scoped API keys.")
+RUNTIME_SCOPES = frozenset({"responses:create", "runtime"})
 
 
 @app.command("list")
@@ -27,13 +28,14 @@ def list_keys(ctx: typer.Context) -> None:
             item.get("masked_key", ""),
             item.get("project_id", ""),
             ",".join(item.get("scopes", [])),
+            item.get("runtime_mode", "") or "management",
             item.get("expires_at", "") or "",
             item.get("id", ""),
         ]
         for item in items
         if isinstance(item, dict)
     ]
-    table("API Keys", ["Name", "Key", "Project", "Scopes", "Expires", "ID"], rows)
+    table("API Keys", ["Name", "Key", "Project", "Scopes", "Mode", "Expires", "ID"], rows)
 
 
 @app.command("create")
@@ -45,16 +47,42 @@ def create_key(
         list[str] | None,
         typer.Option("--scope", help="Scope to grant; repeatable."),
     ] = None,
+    runtime_mode: str | None = typer.Option(
+        None,
+        "--runtime-mode",
+        help="Runtime environment for application keys: test or live.",
+    ),
     expires_at: str | None = typer.Option(None, help="Optional ISO-8601 expiration timestamp."),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
     """Create an API key and print the raw secret once."""
 
     runtime: Runtime = ctx.obj
-    payload: dict[str, object] = {
-        "name": name,
-        "scopes": scope or ["admin"],
-    }
+    scopes = scope or (["responses:create"] if project else ["admin"])
+    role = _credential_role(scopes)
+    if role == "mixed":
+        raise typer.BadParameter(
+            "Runtime and management scopes cannot be combined on one key.",
+            param_hint="--scope",
+        )
+    if role == "runtime" and not project:
+        raise typer.BadParameter(
+            "Runtime-scoped keys require --project.",
+            param_hint="--project",
+        )
+    if runtime_mode not in {None, "test", "live"}:
+        raise typer.BadParameter(
+            "Runtime mode must be test or live.",
+            param_hint="--runtime-mode",
+        )
+    if role == "management" and runtime_mode is not None:
+        raise typer.BadParameter(
+            "--runtime-mode is only valid for runtime-scoped keys.",
+            param_hint="--runtime-mode",
+        )
+    payload: dict[str, object] = {"name": name, "scopes": scopes}
+    if role == "runtime":
+        payload["runtime_mode"] = runtime_mode or "test"
     with runtime.client() as client:
         if project:
             project_payload = resolve_project(client, project)
@@ -75,8 +103,20 @@ def create_key(
         f"api_key: {response.get('api_key', '')}\n"
         f"masked_key: {response.get('masked_key', '')}\n"
         f"project_id: {response.get('project_id', payload.get('project_id', ''))}\n"
-        f"scopes: {','.join(response.get('scopes', []))}",
+        f"scopes: {','.join(response.get('scopes', []))}\n"
+        f"mode: {response.get('runtime_mode') or 'management'}",
     )
+
+
+def _credential_role(scopes: list[str]) -> str:
+    """Classify a requested scope set without allowing mixed authority."""
+
+    normalized = {value.strip().casefold() for value in scopes if value.strip()}
+    has_runtime_scope = bool(normalized & RUNTIME_SCOPES)
+    has_management_scope = bool(normalized - RUNTIME_SCOPES)
+    if has_runtime_scope and has_management_scope:
+        return "mixed"
+    return "runtime" if has_runtime_scope else "management"
 
 
 @app.command("update")

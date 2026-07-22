@@ -12,10 +12,18 @@ import httpx
 import yaml
 from pydantic import BaseModel, Field
 
+from platform_cli.errors import CLIError
+from platform_cli.secure_filesystem import (
+    confined_path,
+    read_named_text_files_no_follow,
+    read_text_no_follow,
+)
+
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 PUBLIC_MANIFEST_FILENAME = "genaug-agent.yaml"
 CODING_AGENT_PROMPT_FILENAME = "CODING_AGENT_PROMPT.md"
 PUBLIC_API_VERSION = "genaug/v1"
+PROJECT_API_VERSION = "genaug/v2"
 MODEL_KEYS = {"simple", "balanced", "complex"}
 VALID_MODEL_PREFIXES = (
     "anthropic/",
@@ -236,11 +244,15 @@ def scaffold_basic_agent(
     )
 
 
-def validate_local_agent_config(config_path: Path) -> LocalValidationResult:
+def validate_local_agent_config(
+    config_path: Path,
+    *,
+    yaml_content: str | None = None,
+) -> LocalValidationResult:
     """Validate a local genaug-agent.yaml manifest without calling the hosted API."""
     errors: list[str] = []
     warnings: list[str] = []
-    payload = _load_yaml_mapping(config_path, errors)
+    payload = _load_yaml_mapping(config_path, errors, yaml_content=yaml_content)
     project_name: str | None = None
     soul_file: Path | None = None
     skills_dir: Path | None = None
@@ -251,12 +263,24 @@ def validate_local_agent_config(config_path: Path) -> LocalValidationResult:
     if payload is not None:
         _validate_manifest_identity(payload, errors)
         project_name = _validate_metadata(payload.get("metadata"), errors)
-        _validate_model_routes(payload.get("model"), errors, warnings)
-        soul_file = _validate_personality(payload.get("personality"), config_path, errors, warnings)
         builtin_tools, mcp_servers = _validate_tools(payload.get("tools"), errors, warnings)
         skills_dir, skill_count = _validate_skills(payload.get("skills"), config_path, warnings)
         tool_discovery = _validate_behavior(payload.get("behavior"), errors)
         _validate_channels(payload.get("channels"), warnings)
+        if payload.get("kind") == "Project":
+            soul_file = _validate_project_agents(
+                payload.get("agents"),
+                project_tools=builtin_tools,
+                memory=payload.get("memory"),
+                config_path=config_path,
+                errors=errors,
+                warnings=warnings,
+            )
+        else:
+            _validate_model_routes(payload.get("model"), errors, warnings)
+            soul_file = _validate_personality(
+                payload.get("personality"), config_path, errors, warnings
+            )
     return LocalValidationResult(
         config_path=config_path,
         status="FAIL" if errors else "PASS",
@@ -356,43 +380,83 @@ def scaffold_from_openapi(
     )
 
 
-def load_deploy_payload(config_path: Path) -> dict[str, Any]:
+def load_deploy_payload(
+    config_path: Path,
+    *,
+    yaml_content: str | None = None,
+) -> dict[str, Any]:
     """Validate and load local agent config plus optional SOUL.md and skills."""
-    validation = validate_local_agent_config(config_path)
+    validation = validate_local_agent_config(config_path, yaml_content=yaml_content)
     if validation.errors:
         raise ValueError(f"Agent manifest validation failed: {'; '.join(validation.errors)}")
-    yaml_content = config_path.read_text(encoding="utf-8")
-    payload = yaml.safe_load(yaml_content)
+    content = yaml_content if yaml_content is not None else config_path.read_text(encoding="utf-8")
+    payload = yaml.safe_load(content)
     if not isinstance(payload, dict):
         raise ValueError("Agent manifest must contain a YAML object.")
-    if payload.get("apiVersion") != PUBLIC_API_VERSION or payload.get("kind") != "Agent":
+    if (payload.get("apiVersion"), payload.get("kind")) not in {
+        (PUBLIC_API_VERSION, "Agent"),
+        (PROJECT_API_VERSION, "Project"),
+    }:
         raise ValueError(
-            "Agent manifest must use apiVersion genaug/v1 and kind Agent."
+            "Manifest must use apiVersion genaug/v1 with kind Agent or "
+            "apiVersion genaug/v2 with kind Project."
         )
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict) or not metadata.get("name"):
         raise ValueError("Agent manifest metadata.name is required.")
 
     personality = payload.get("personality") if isinstance(payload.get("personality"), dict) else {}
+    if payload.get("kind") == "Project":
+        raw_agents = payload.get("agents")
+        agents: list[Any] = raw_agents if isinstance(raw_agents, list) else []
+        entry = next(
+            (
+                item
+                for item in agents
+                if isinstance(item, dict) and item.get("entry") is True
+            ),
+            {},
+        )
+        personality = (
+            entry.get("personality")
+            if isinstance(entry, dict) and isinstance(entry.get("personality"), dict)
+            else {}
+        )
     soul_content = None
     soul_file = personality.get("soul_file") if isinstance(personality, dict) else None
     if isinstance(soul_file, str) and soul_file:
-        soul_path = (config_path.parent / soul_file).resolve()
-        soul_content = soul_path.read_text(encoding="utf-8")
+        workspace = config_path.parent.resolve()
+        soul_path = confined_path(
+            workspace,
+            workspace / soul_file,
+            description="SOUL file",
+        )
+        soul_content = read_text_no_follow(
+            workspace,
+            soul_path,
+            description="SOUL file",
+        )
+        if soul_content is None:
+            raise ValueError(f"personality.soul_file was not found: {soul_file}")
 
     skills: list[str] = []
     skills_block = payload.get("skills") if isinstance(payload.get("skills"), dict) else {}
     skills_dir = skills_block.get("directory") if isinstance(skills_block, dict) else None
     if isinstance(skills_dir, str) and skills_dir:
-        root = (config_path.parent / skills_dir).resolve()
-        if root.exists():
-            skills = [
-                path.read_text(encoding="utf-8")
-                for path in sorted(root.rglob("*.md"))
-                if path.name.upper() == "SKILL.MD"
-            ]
+        workspace = config_path.parent.resolve()
+        root = confined_path(
+            workspace,
+            workspace / skills_dir,
+            description="skills directory",
+        )
+        skills = read_named_text_files_no_follow(
+            workspace,
+            root,
+            filename="SKILL.md",
+            description="skills directory",
+        )
     return {
-        "yaml_content": yaml_content,
+        "yaml_content": content,
         "soul_content": soul_content,
         "skills": skills,
     }
@@ -409,10 +473,20 @@ def project_name_from_config(config_path: Path) -> str:
     return name
 
 
-def _load_yaml_mapping(config_path: Path, errors: list[str]) -> dict[str, Any] | None:
+def _load_yaml_mapping(
+    config_path: Path,
+    errors: list[str],
+    *,
+    yaml_content: str | None = None,
+) -> dict[str, Any] | None:
     """Load a YAML object for local validation."""
     try:
-        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        content = (
+            yaml_content
+            if yaml_content is not None
+            else config_path.read_text(encoding="utf-8")
+        )
+        payload = yaml.safe_load(content)
     except yaml.YAMLError as exc:
         errors.append(f"Invalid YAML: {exc}")
         return None
@@ -427,8 +501,121 @@ def _load_yaml_mapping(config_path: Path, errors: list[str]) -> dict[str, Any] |
 
 def _validate_manifest_identity(payload: dict[str, Any], errors: list[str]) -> None:
     """Validate top-level manifest identity fields."""
-    if payload.get("apiVersion") != PUBLIC_API_VERSION or payload.get("kind") != "Agent":
-        errors.append("Agent manifest must use apiVersion genaug/v1 and kind Agent.")
+    if (payload.get("apiVersion"), payload.get("kind")) not in {
+        (PUBLIC_API_VERSION, "Agent"),
+        (PROJECT_API_VERSION, "Project"),
+    }:
+        errors.append(
+            "Manifest must use apiVersion genaug/v1 with kind Agent or "
+            "apiVersion genaug/v2 with kind Project."
+        )
+
+
+def _validate_project_agents(
+    agents: object,
+    *,
+    project_tools: list[str],
+    memory: object,
+    config_path: Path,
+    errors: list[str],
+    warnings: list[str],
+) -> Path | None:
+    """Validate Project Agent topology and return the entry Agent SOUL path."""
+    if not isinstance(agents, list) or not agents:
+        errors.append("agents must contain at least one Agent.")
+        return None
+    rows = [item for item in agents if isinstance(item, dict)]
+    if len(rows) != len(agents):
+        errors.append("Every agents item must be an object.")
+    names = [str(item.get("name") or "") for item in rows]
+    if any(not name for name in names):
+        errors.append("Every Agent requires a non-empty name.")
+    if len(names) != len(set(names)):
+        errors.append("Project Agent names must be unique.")
+    entries = [item for item in rows if item.get("entry") is True]
+    if len(entries) != 1:
+        errors.append("Project manifest must define exactly one entry Agent.")
+
+    namespaces: set[str] = set()
+    if isinstance(memory, dict) and isinstance(memory.get("namespaces"), dict):
+        namespaces = {str(name) for name in memory["namespaces"]}
+    catalog = set(project_tools)
+    entry_soul: Path | None = None
+    known = set(names)
+    graph: dict[str, set[str]] = {name: set() for name in names}
+    for index, agent in enumerate(rows):
+        name = str(agent.get("name") or f"agents[{index}]")
+        _validate_model_routes(agent.get("model"), errors, warnings)
+        soul = _validate_personality(agent.get("personality"), config_path, errors, warnings)
+        if agent.get("entry") is True:
+            entry_soul = soul
+        assigned_tools = _string_list(
+            agent.get("tools"), field_name=f"agents[{index}].tools", errors=errors
+        )
+        unknown_tools = sorted(set(assigned_tools) - catalog)
+        if unknown_tools:
+            errors.append(
+                f"Agent {name} references tools outside the Project catalog: "
+                f"{', '.join(unknown_tools)}"
+            )
+        raw_memory = agent.get("memory")
+        if raw_memory is not None and not isinstance(raw_memory, dict):
+            errors.append(f"agents[{index}].memory must be an object.")
+        elif isinstance(raw_memory, dict):
+            unknown_memory = sorted({str(key) for key in raw_memory} - namespaces)
+            if unknown_memory:
+                errors.append(
+                    f"Agent {name} references unknown memory namespaces: "
+                    f"{', '.join(unknown_memory)}"
+                )
+            invalid_modes = sorted(
+                str(value)
+                for value in raw_memory.values()
+                if value not in {"none", "read", "read_write"}
+            )
+            if invalid_modes:
+                errors.append(f"Agent {name} has invalid memory access modes.")
+        raw_delegations = agent.get("delegations")
+        if raw_delegations is None:
+            continue
+        if not isinstance(raw_delegations, list):
+            errors.append(f"agents[{index}].delegations must be a list.")
+            continue
+        for delegation in raw_delegations:
+            if not isinstance(delegation, dict):
+                errors.append(f"Agent {name} delegation must be an object.")
+                continue
+            target = str(delegation.get("to") or "")
+            if not target or target not in known:
+                errors.append(f"Agent {name} delegates to unknown Agent {target or '(missing)' }.")
+            if target == name:
+                errors.append(f"Agent {name} cannot delegate to itself.")
+            elif target in known:
+                graph[name].add(target)
+            if delegation.get("mode", "as_tool") not in {"as_tool", "handoff"}:
+                errors.append(f"Agent {name} delegation mode must be as_tool or handoff.")
+    if _graph_has_cycle(graph):
+        errors.append("Project Agent delegations must not contain a cycle.")
+    return entry_soul
+
+
+def _graph_has_cycle(graph: dict[str, set[str]]) -> bool:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> bool:
+        if node in visiting:
+            return True
+        if node in visited:
+            return False
+        visiting.add(node)
+        if any(visit(target) for target in graph.get(node, set())):
+            return True
+        visiting.remove(node)
+        visited.add(node)
+        return False
+
+    return any(visit(node) for node in graph)
 
 
 def _validate_metadata(metadata: object, errors: list[str]) -> str | None:
@@ -490,8 +677,22 @@ def _validate_personality(
     if not isinstance(raw_soul_file, str) or not raw_soul_file.strip():
         errors.append("personality.soul_file must be a non-empty string when provided.")
         return None
-    soul_path = (config_path.parent / raw_soul_file).resolve()
-    if not soul_path.is_file():
+    workspace = config_path.parent.resolve()
+    try:
+        soul_path = confined_path(
+            workspace,
+            workspace / raw_soul_file,
+            description="SOUL file",
+        )
+        soul_content = read_text_no_follow(
+            workspace,
+            soul_path,
+            description="SOUL file",
+        )
+    except CLIError as exc:
+        errors.append(str(exc))
+        return None
+    if soul_content is None:
         errors.append(f"personality.soul_file was not found: {raw_soul_file}")
         return soul_path
     return soul_path
@@ -606,15 +807,26 @@ def _validate_skills(
     if not isinstance(raw_directory, str) or not raw_directory.strip():
         warnings.append("skills.directory is missing; no local skills will be deployed.")
         return None, 0
-    skills_dir = (config_path.parent / raw_directory).resolve()
+    workspace = config_path.parent.resolve()
+    try:
+        skills_dir = confined_path(
+            workspace,
+            workspace / raw_directory,
+            description="skills directory",
+        )
+        skill_contents = read_named_text_files_no_follow(
+            workspace,
+            skills_dir,
+            filename="SKILL.md",
+            description="skills directory",
+        )
+    except (CLIError, FileNotFoundError, NotADirectoryError) as exc:
+        warnings.append(str(exc))
+        return None, 0
     if not skills_dir.exists():
         warnings.append(f"skills.directory was not found: {raw_directory}")
         return skills_dir, 0
-    if not skills_dir.is_dir():
-        warnings.append(f"skills.directory is not a directory: {raw_directory}")
-        return skills_dir, 0
-    skill_count = sum(1 for path in skills_dir.rglob("SKILL.md") if path.is_file())
-    return skills_dir, skill_count
+    return skills_dir, len(skill_contents)
 
 
 def _validate_behavior(behavior: object, errors: list[str]) -> dict[str, Any]:

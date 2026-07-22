@@ -47,11 +47,16 @@ export class ResponsesClient {
         request: GeneralAugment.ResponsesRequest,
         requestOptions?: ResponsesClient.RequestOptions,
     ): Promise<core.WithRawResponse<GeneralAugment.ResponsesResponse>> {
+        const { "X-Agent-ID": agentId, "X-Deployment-ID": deploymentId, ..._body } = request;
         const _authRequest: core.AuthRequest = await this._options.authProvider.getAuthRequest();
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             _authRequest.headers,
             this._options?.headers,
-            mergeOnlyDefinedHeaders({ "X-Project-ID": requestOptions?.projectId ?? this._options?.projectId }),
+            mergeOnlyDefinedHeaders({
+                "X-Agent-ID": agentId ?? undefined,
+                "X-Deployment-ID": deploymentId ?? undefined,
+                "X-Project-ID": requestOptions?.projectId ?? this._options?.projectId,
+            }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -66,7 +71,7 @@ export class ResponsesClient {
             contentType: "application/json",
             queryString: core.url.queryBuilder().mergeAdditional(requestOptions?.queryParams).build(),
             requestType: "json",
-            body: request,
+            body: _body,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
             abortSignal: requestOptions?.abortSignal,

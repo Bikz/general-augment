@@ -381,13 +381,16 @@ class LocalGAMockStore:
         """Create a deterministic local API key row."""
 
         key_id = f"key_mock_{_digest_json(payload)[:12]}"
-        raw_key = f"gaadmlocal_{_digest_json({'key_id': key_id})[:24]}"
+        runtime_mode = payload.get("runtime_mode")
+        key_prefix = f"gab{runtime_mode}" if runtime_mode in {"test", "live"} else "gaadmlocal"
+        raw_key = f"{key_prefix}_{_digest_json({'key_id': key_id})[:24]}"
         row = {
             "id": key_id,
             "name": str(payload.get("name") or "Local mock key"),
             "api_key": raw_key,
             "masked_key": f"{raw_key[:12]}...{raw_key[-4:]}",
             "scopes": payload.get("scopes") or ["admin"],
+            "runtime_mode": runtime_mode,
             "project_id": payload.get("project_id"),
             "expires_at": payload.get("expires_at"),
             "created_by": "local_mock",

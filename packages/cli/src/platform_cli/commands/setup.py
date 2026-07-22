@@ -19,6 +19,7 @@ from platform_cli.runtime import Runtime
 from platform_cli.self_serve import (
     build_setup_payload,
     guided_answers_template,
+    installer_access_token,
     installer_auth_metadata,
     normalize_capabilities,
     provider_setup_recipes,
@@ -203,11 +204,24 @@ def setup(
         if isinstance(project_payload, dict):
             selected_project = str(project_payload.get("id") or selected_project or "")
             config_update: dict[str, object] = {"active_project": selected_project}
-            # Persist the minted runtime key so smoke/verify/doctor authenticate
-            # without a manual `export`. The config file is chmod 600 and the raw
-            # key is never written to artifacts or echoed unless --print-env asks.
+            # Persist the minted runtime key in its explicit application-only role.
+            # Never place it in the legacy management ``api_key`` field.
             if runtime_env and runtime_env.get("GENAUG_API_KEY"):
-                config_update["api_key"] = runtime_env["GENAUG_API_KEY"]
+                runtime_key = bootstrap_payload.get("runtime_key")
+                runtime_key_metadata = runtime_key if isinstance(runtime_key, dict) else {}
+                config_update.update(
+                    {
+                        "runtime_api_key": runtime_env["GENAUG_API_KEY"],
+                        "runtime_key_id": str(runtime_key_metadata.get("id") or ""),
+                        "runtime_key_project_id": selected_project,
+                        "runtime_key_scopes": list(
+                            runtime_key_metadata.get("scopes") or ["responses:create"]
+                        ),
+                        "runtime_key_mode": str(
+                            runtime_key_metadata.get("runtime_mode") or "test"
+                        ),
+                    }
+                )
             setup_config = runtime.config.model_copy(update=config_update)
             save_config(setup_config, runtime.config_path)
     payload = build_setup_payload(
@@ -1079,7 +1093,7 @@ def _bootstrap_setup(
     installer = installer_auth_metadata(runtime.config)
     if installer is None:
         raise CLIError("Run genaug auth login before genaug setup --bootstrap.")
-    token = str(installer["access_token"])
+    token = installer_access_token(runtime)
     with runtime.client() as client:
         projects_payload = client.installer("GET", "/projects", token=token)
         project_payload = _select_or_create_project(
@@ -1090,6 +1104,7 @@ def _bootstrap_setup(
             project=project,
             project_name=project_name,
             project_slug=project_slug,
+            workspace_id=runtime.config.active_workspace,
         )
         runtime_key_payload = None
         if not skip_runtime_key:
@@ -1097,7 +1112,11 @@ def _bootstrap_setup(
                 "POST",
                 f"/projects/{encode_path_segment(str(project_payload['id']))}/runtime-keys",
                 token=token,
-                json={"name": runtime_key_name, "scopes": ["responses:create"]},
+                json={
+                    "name": runtime_key_name,
+                    "scopes": ["responses:create"],
+                    "runtime_mode": "test",
+                },
             )
     redacted = {
         "applied": True,
@@ -1122,6 +1141,7 @@ def _select_or_create_project(
     project: str | None,
     project_name: str | None,
     project_slug: str | None,
+    workspace_id: str | None = None,
 ) -> dict[str, object]:
     """Select an existing installer project or create one."""
     items = _project_items(projects_payload)
@@ -1140,13 +1160,21 @@ def _select_or_create_project(
 
     name = project_name or project or _default_project_name(workspace)
     slug = project_slug or _slugify(name)
+    for item in items:
+        if slug == str(item.get("slug", "")) or name == str(item.get("name", "")):
+            return item
     return cast(
         dict[str, object],
         client.installer(
             "POST",
             "/projects",
             token=token,
-            json={"name": name, "slug": slug, "system_prompt": "You are a helpful agent."},
+            json={
+                "name": name,
+                "slug": slug,
+                "system_prompt": "You are a helpful agent.",
+                **({"workspace_id": workspace_id} if workspace_id else {}),
+            },
         ),
     )
 

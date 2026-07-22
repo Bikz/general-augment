@@ -5,12 +5,460 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+import yaml
 from click.testing import Result
 from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
+from platform_cli.commands import launch as launch_command
 from platform_cli.commands import migrate as migrate_command
+from platform_cli.errors import CLIError
+from platform_cli.launch_verification import (
+    EXPECTED_EVIDENCE_PRODUCERS,
+    REQUIRED_BETA_CHECKS,
+    check_result,
+)
 from platform_cli.main import app
+from platform_cli.openapi import load_deploy_payload
+
+
+def _next_clerk_workspace(root: Path) -> Path:
+    workspace = root / "clerk-next-app"
+    route = workspace / "app" / "api" / "assistant"
+    route.mkdir(parents=True)
+    (workspace / "package.json").write_text(
+        json.dumps(
+            {
+                "dependencies": {
+                    "@clerk/nextjs": "7.2.4",
+                    "next": "15.5.18",
+                    "react": "19.1.1",
+                    "typescript": "5.9.3",
+                },
+                "scripts": {
+                    "test": "vitest run",
+                    "typecheck": "tsc --noEmit",
+                    "build": "next build",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "next.config.ts").write_text("export default {};\n", encoding="utf-8")
+    (route / "route.ts").write_text(
+        "import { auth } from '@clerk/nextjs/server';\n"
+        "export async function POST() {\n"
+        "  const { userId } = await auth();\n"
+        "  return Response.json({ userId });\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (route / "route.test.ts").write_text(
+        "describe('assistant route', () => {});\n",
+        encoding="utf-8",
+    )
+    (workspace / "app" / "assistant.tsx").write_text(
+        "export function Assistant() { return <form aria-label='Assistant' />; }\n",
+        encoding="utf-8",
+    )
+    (workspace / ".env.local").write_text(
+        "CLERK_SECRET_KEY=must-not-leak\nNEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=public-placeholder\n",
+        encoding="utf-8",
+    )
+    return workspace
+
+
+def test_launch_inspect_is_read_only_and_secret_free(tmp_path: Path) -> None:
+    """Launch inspection should identify the Clerk golden path without writing files."""
+    workspace = _next_clerk_workspace(tmp_path)
+    config = tmp_path / "config.yaml"
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config",
+            str(config),
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--inspect",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "must-not-leak" not in result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "INSPECTED"
+    assert payload["inspection"]["detected"]["frameworks"] == ["nextjs"]
+    assert payload["inspection"]["detected"]["auth"]["provider"] == "clerk"
+    assert payload["inspection"]["detected"]["stable_user_candidates"][0]["server_side"] is True
+    assert payload["inspection"]["detected"]["assistant_surfaces"][0] == {
+        "file": "app/assistant.tsx",
+        "kind": "in_app_assistant",
+    }
+    assert all(
+        not item["file"].endswith(".test.ts")
+        for item in payload["inspection"]["detected"]["assistant_surfaces"]
+    )
+    assert not (workspace / "genaug-agent.yaml").exists()
+    assert not config.exists()
+
+
+def test_launch_plan_is_idempotent_and_safe_mode(tmp_path: Path) -> None:
+    """Planning twice should preserve one deterministic contract and session id."""
+    workspace = _next_clerk_workspace(tmp_path)
+    config = tmp_path / "config.yaml"
+    args = [
+        "--config",
+        str(config),
+        "launch",
+        "--workspace",
+        str(workspace),
+        "--plan",
+        "--json",
+    ]
+    first = CliRunner().invoke(app, args)
+    assert first.exit_code == 0, first.output
+    manifest_path = workspace / "genaug-agent.yaml"
+    first_manifest = manifest_path.read_text(encoding="utf-8")
+    second = CliRunner().invoke(app, args)
+    assert second.exit_code == 0, second.output
+    assert manifest_path.read_text(encoding="utf-8") == first_manifest
+    first_payload = json.loads(first.output)
+    second_payload = json.loads(second.output)
+    assert first_payload["session_id"] == second_payload["session_id"]
+    manifest = yaml.safe_load(first_manifest)
+    launch_contract = manifest["x-general-augment-launch"]
+    assert launch_contract["safe_mode"] == {
+        "enabled": True,
+        "untrusted_code_execution": False,
+        "automatic_skill_learning": False,
+        "general_augment_write_tools": False,
+    }
+    assert launch_contract["identity"]["provider"] == "clerk"
+    assert launch_contract["memory"]["scope"] == "per_user"
+    assert manifest["skills"]["learning_enabled"] is False
+    assert "must-not-leak" not in first_manifest
+
+
+def test_launch_plan_preserves_existing_declarative_contract_bytes(tmp_path: Path) -> None:
+    """A plan rerun must not replace customer-authored Agent or safety decisions."""
+
+    workspace = _next_clerk_workspace(tmp_path)
+    config = tmp_path / "config.yaml"
+    args = [
+        "--config",
+        str(config),
+        "launch",
+        "--workspace",
+        str(workspace),
+        "--plan",
+        "--json",
+    ]
+    first = CliRunner().invoke(app, args)
+    assert first.exit_code == 0, first.output
+    manifest_path = workspace / "genaug-agent.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["behavior"]["max_tool_calls_per_turn"] = 1
+    manifest["x-general-augment-launch"]["capabilities"] = [
+        {
+            "name": "habit_list_context",
+            "source": {"file": "lib/habits.ts", "symbol": "listHabitsForUser"},
+            "classification": "read_only",
+            "execution_owner": "application",
+            "enabled": False,
+            "enable_after_review": True,
+        }
+    ]
+    manifest["x-general-augment-launch"]["application"]["assistant_surface"] = {
+        "file": "app/assistant.tsx",
+        "kind": "in_app_assistant",
+    }
+    declared = "# Customer-owned launch contract.\n" + yaml.safe_dump(
+        manifest,
+        sort_keys=False,
+    )
+    manifest_path.write_text(declared, encoding="utf-8")
+
+    rerun = CliRunner().invoke(app, args)
+
+    assert rerun.exit_code == 0, rerun.output
+    assert manifest_path.read_text(encoding="utf-8") == declared
+    payload = json.loads(rerun.output)
+    assert payload["status"] == "REVIEW_REQUIRED"
+    assert payload["validation"]["status"] == "PASS"
+
+
+def test_launch_plan_blocks_unsafe_existing_contract_without_rewriting(tmp_path: Path) -> None:
+    """Unsafe declarations fail closed and remain available for the author to correct."""
+
+    workspace = _next_clerk_workspace(tmp_path)
+    config = tmp_path / "config.yaml"
+    args = [
+        "--config",
+        str(config),
+        "launch",
+        "--workspace",
+        str(workspace),
+        "--plan",
+        "--json",
+    ]
+    first = CliRunner().invoke(app, args)
+    assert first.exit_code == 0, first.output
+    manifest_path = workspace / "genaug-agent.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["tools"] = {"builtin": ["shell"], "mcp": [{"name": "write-api"}]}
+    manifest["skills"] = {"learning_enabled": True}
+    manifest["behavior"]["tool_discovery"]["allow_runtime_skill_writes"] = True
+    declared = yaml.safe_dump(manifest, sort_keys=False)
+    manifest_path.write_text(declared, encoding="utf-8")
+
+    blocked = CliRunner().invoke(app, args)
+
+    assert blocked.exit_code != 0
+    assert "validation failed" in blocked.output.lower()
+    assert manifest_path.read_text(encoding="utf-8") == declared
+
+
+def test_launch_plan_refuses_manifest_symlink_outside_workspace(tmp_path: Path) -> None:
+    """Planning must not follow a repository manifest symlink into another file."""
+    workspace = _next_clerk_workspace(tmp_path)
+    outside = tmp_path / "deployment.yaml"
+    original = "production: unchanged\n"
+    outside.write_text(original, encoding="utf-8")
+    (workspace / "genaug-agent.yaml").symlink_to(outside)
+
+    result = CliRunner().invoke(
+        app,
+        ["launch", "--workspace", str(workspace), "--plan", "--json"],
+    )
+
+    assert result.exit_code != 0
+    assert "symlinked" in result.output.lower()
+    assert outside.read_text(encoding="utf-8") == original
+
+
+def test_launch_plan_refuses_manifest_path_outside_workspace(tmp_path: Path) -> None:
+    """An explicit manifest output must stay inside the selected application workspace."""
+    workspace = _next_clerk_workspace(tmp_path)
+    outside = tmp_path / "outside.yaml"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--manifest",
+            str(outside),
+            "--plan",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "workspace" in result.output.lower()
+    assert not outside.exists()
+
+
+def test_launch_plan_resolves_relative_manifest_inside_workspace(tmp_path: Path) -> None:
+    """A relative manifest option is relative to the selected application workspace."""
+
+    workspace = _next_clerk_workspace(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        [
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--manifest",
+            "config/custom-agent.yaml",
+            "--plan",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (workspace / "config" / "custom-agent.yaml").is_file()
+
+
+def test_launch_apply_refuses_manifest_symlink_before_writing_handoff(tmp_path: Path) -> None:
+    """Every non-plan phase must retain the same no-follow manifest boundary."""
+
+    workspace = _next_clerk_workspace(tmp_path)
+    outside = tmp_path / "outside-agent.yaml"
+    outside.write_text("apiVersion: genaug/v1\nkind: Agent\n", encoding="utf-8")
+    (workspace / "genaug-agent.yaml").symlink_to(outside)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "launch",
+            "--workspace",
+            str(workspace),
+            "--project",
+            "project-1",
+            "--apply",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "symlinked" in result.output.lower()
+    assert not (workspace / ".genaug" / "launch-handoff.md").exists()
+
+
+def test_launch_payload_refuses_soul_file_outside_workspace(tmp_path: Path) -> None:
+    """A repository manifest cannot upload an arbitrary file as its SOUL content."""
+
+    workspace = tmp_path / "app"
+    workspace.mkdir()
+    (tmp_path / "outside.md").write_text("private host material", encoding="utf-8")
+    manifest = _write_payload_manifest(workspace, personality={"soul_file": "../outside.md"})
+
+    with pytest.raises((CLIError, ValueError), match="inside the selected workspace"):
+        load_deploy_payload(manifest)
+
+
+def test_launch_payload_refuses_symlinked_skills_directory(tmp_path: Path) -> None:
+    """Skill collection must not traverse a repository symlink to host files."""
+
+    workspace = tmp_path / "app"
+    workspace.mkdir()
+    outside = tmp_path / "outside-skills"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text(
+        "---\nname: private\ndescription: private\nversion: 1.0.0\n---\nprivate\n",
+        encoding="utf-8",
+    )
+    (workspace / "skills").symlink_to(outside, target_is_directory=True)
+    manifest = _write_payload_manifest(workspace, skills={"directory": "./skills"})
+
+    with pytest.raises(CLIError, match="symlinked skills directory"):
+        load_deploy_payload(manifest)
+
+
+def _write_payload_manifest(
+    workspace: Path,
+    *,
+    personality: dict[str, object] | None = None,
+    skills: dict[str, object] | None = None,
+) -> Path:
+    """Write a minimal locally valid launch payload manifest."""
+
+    manifest = workspace / "genaug-agent.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "genaug/v1",
+                "kind": "Agent",
+                "metadata": {"name": "safe-agent"},
+                "personality": personality or {"description": "Safe beta assistant."},
+                "model": {
+                    "simple": "openai/gpt-5-mini",
+                    "balanced": "openai/gpt-5",
+                    "complex": "openai/gpt-5",
+                },
+                "tools": {"builtin": [], "mcp": []},
+                "skills": skills or {},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_launch_verify_returns_stable_machine_verdict(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """Launch verification should compose hosted evidence into a stable verdict."""
+    workspace = _next_clerk_workspace(tmp_path)
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "base_url: http://api.test\napi_key: synthetic-test-only\nactive_project: project-1\n",
+        encoding="utf-8",
+    )
+    plan = CliRunner().invoke(
+        app,
+        ["--config", str(config), "launch", "--workspace", str(workspace), "--plan", "--json"],
+    )
+    assert plan.exit_code == 0, plan.output
+    local_names = {
+        "read_only_application_capability",
+        "application_typecheck_or_equivalent",
+        "application_build",
+        "application_browser_smoke",
+        "secret_not_browser_visible",
+        "rollback_documented",
+    }
+
+    def passed(name: str) -> dict[str, object]:
+        return check_result(
+            name,
+            "PASS",
+            f"{name}_passed",
+            "Verified.",
+            evidence=[{"artifact_sha256": f"sha256-{name}"}],
+            producer=EXPECTED_EVIDENCE_PRODUCERS[name],
+        )
+
+    monkeypatch.setattr(
+        "platform_cli.commands.launch.collect_hosted_preflight_checks",
+        lambda *_args, **_kwargs: (
+            [
+                passed("cli_api_skill_manifest_compatibility"),
+                passed("launch_session_approved"),
+            ],
+            {"api": {"status": "ok"}},
+        ),
+    )
+
+    monkeypatch.setattr(
+        "platform_cli.commands.launch.collect_application_checks",
+        lambda *_args, **_kwargs: (
+            [passed(name) for name in REQUIRED_BETA_CHECKS if name in local_names],
+            {"receipts": []},
+        ),
+    )
+    monkeypatch.setattr(
+        "platform_cli.commands.launch.collect_hosted_checks",
+        lambda *_args, **_kwargs: (
+            [passed(name) for name in REQUIRED_BETA_CHECKS if name not in local_names],
+            {"project_id": "project-1"},
+        ),
+    )
+    monkeypatch.setattr(
+        "platform_cli.commands.launch.correlate_application_checks",
+        lambda _client, checks, **_kwargs: checks,
+    )
+    result = CliRunner().invoke(
+        app,
+        ["--config", str(config), "launch", "--workspace", str(workspace), "--verify", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["verdict"] in {"READY", "READY_WITH_WARNINGS"}
+    assert len(payload["checks"]) == len(REQUIRED_BETA_CHECKS)
+    assert all(check["status"] == "PASS" for check in payload["checks"])
+    assert payload["hosted"]["project_id"] == "project-1"
+    assert payload["activation"] == {
+        "performed": False,
+        "reason": "verification_is_side_effect_free",
+        "next_action": "Run `genaug launch --finalize --json` after reviewing READY evidence.",
+    }
+    assert "release" not in payload
+    assert "/dashboard/projects/project-1/launch/" in payload["dashboard_review_url"]
+    assert Path(payload["verification_receipt_path"]).is_file()
+
+
+def test_launch_review_url_honors_dashboard_environment(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("GENAUG_DASHBOARD_URL", "https://preview.example.test/")
+
+    assert launch_command._review_url("project/id", "launch id") == (
+        "https://preview.example.test/dashboard/projects/project%2Fid/launch/launch%20id"
+    )
 
 
 def test_setup_inspects_workspace_and_writes_secret_free_plan(tmp_path: Path) -> None:
@@ -39,6 +487,8 @@ def test_setup_inspects_workspace_and_writes_secret_free_plan(tmp_path: Path) ->
     result = CliRunner().invoke(
         app,
         [
+            "--config",
+            str(tmp_path / "config.yaml"),
             "setup",
             "--workspace",
             str(workspace),

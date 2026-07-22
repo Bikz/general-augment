@@ -21,6 +21,11 @@ class ProjectResponse(UniversalBaseModel):
     id: str
     langfuse_project_id: typing.Optional[str] = None
     langfuse_public_key: typing.Optional[str] = None
+    launch_approval_policy: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Human-owned launch authorization policy. Manifests and installer credentials cannot change this value.
+    """
+
     local_connectors: typing.Optional[typing.List[typing.Dict[str, typing.Any]]] = None
     mcp_servers: typing.List[typing.Dict[str, typing.Any]]
     model_preferences: typing.Dict[str, str]
@@ -63,6 +68,7 @@ class ProjectResponse(UniversalBaseModel):
     """
 
     whatsapp_phone_number_id: typing.Optional[str] = None
+    workspace_id: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
